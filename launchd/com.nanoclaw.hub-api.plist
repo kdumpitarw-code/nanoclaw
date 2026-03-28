@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nanoclaw.hub-api</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{NODE_PATH}}</string>
+        <string>{{PROJECT_ROOT}}/dist/hub-api.js</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_ROOT}}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>HUB_API_PORT</key>
+        <string>4100</string>
+        <key>HUB_API_HOST</key>
+        <string>127.0.0.1</string>
+        <key>CLOUDFLARE_API_TOKEN</key>
+        <string>YOUR_CLOUDFLARE_API_TOKEN_HERE</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{{PROJECT_ROOT}}/logs/hub-api.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{PROJECT_ROOT}}/logs/hub-api.error.log</string>
+</dict>
+</plist>
