@@ -818,8 +818,7 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
               long_term_benefit:
                 (parsed as any).spec?.notes ||
                 'Maintains quality through human review',
-              risk_if_approved:
-                'Review the full proposal via View Diff',
+              risk_if_approved: 'Review the full proposal via View Diff',
             };
 
         resultPayload.proposal = {
@@ -1128,10 +1127,17 @@ const server = createServer(async (req, res) => {
     try {
       log(`Received /api/agent/run-async request`);
 
-      // CF Access validation is handled by the Cloudflare tunnel itself.
-      // Hub-api only listens on 127.0.0.1 — not directly exposed.
-      // TODO: Re-enable once CF Access credential sync is verified.
-      // if (CF_ACCESS_EXPECTED_ID) { ... }
+      // Auth: Cloudflare tunnel validates CF Access headers (strips them before
+      // forwarding to origin). Hub-api validates the shared AGENT_RESULTS_SECRET
+      // as a bearer token for defense-in-depth.
+      if (AGENT_RESULTS_SECRET) {
+        const auth = req.headers['authorization'];
+        if (!auth || auth !== `Bearer ${AGENT_RESULTS_SECRET}`) {
+          log('Agent async auth rejected: invalid bearer token');
+          jsonResponse(res, 403, { error: 'Invalid authorization' });
+          return;
+        }
+      }
 
       const body = JSON.parse(await readBody(req));
       const {
