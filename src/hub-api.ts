@@ -11,13 +11,29 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'http';
-import { mkdirSync, writeFileSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
+
+// Load .env file if present (launchd doesn't source it)
+// Resolve from compiled dist/ back to repo root
+const envPath = join(import.meta.dirname ?? __dirname, '..', '.env');
+if (existsSync(envPath)) {
+  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx < 0) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const val = trimmed.slice(eqIdx + 1).trim();
+    if (!process.env[key]) process.env[key] = val;
+  }
+}
 
 const PORT = parseInt(process.env.HUB_API_PORT || '4100', 10);
 const HOST = process.env.HUB_API_HOST || '127.0.0.1';
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
-const PORTKEY_BASE_URL = process.env.PORTKEY_BASE_URL || 'http://127.0.0.1:8787';
+const PORTKEY_BASE_URL =
+  process.env.PORTKEY_BASE_URL || 'http://127.0.0.1:8787';
 const PORTKEY_API_KEY = process.env.PORTKEY_API_KEY || '';
 const CHROMADB_HOST = process.env.CHROMADB_HOST || 'http://127.0.0.1:8000';
 const EMBED_MODEL = 'nomic-embed-text';
@@ -29,7 +45,13 @@ const CF_ACCESS_EXPECTED_SECRET = process.env.CF_ACCESS_EXPECTED_SECRET || '';
 const AGENT_RESULTS_SECRET = process.env.AGENT_RESULTS_SECRET || '';
 
 // Path to the agents package on this machine
-const AGENTS_BASE = join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub', 'packages', 'agents');
+const AGENTS_BASE = join(
+  process.env.HOME || '/root',
+  'Vibe Sphere',
+  'alacrity_hub',
+  'packages',
+  'agents',
+);
 
 /**
  * Virtual key → Ollama model mapping.
@@ -121,13 +143,180 @@ interface AsyncAgentRequest {
   d1ProxyAuth: string;
 }
 
-const AGENT_CONFIGS: Record<string, { prompt: string; modelKey: string; tools: string[]; maxTokens: number; oversight: string; maxToolRounds: number }> = {
-  pm: { prompt: 'prompts/pm.md', modelKey: 'local-reasoning', tools: ['mission-read','vault-read','spec-write','mission-write','d1-query','audit-query','bookmark-read','project-read','vault-list','doc-read','handoff-write','notify-user','schedule-create','template-create','project-write','git-log','kv-read','pdf-generate','docx-generate','slides-generate','spreadsheet-generate','chart-render','gantt-render','html-report'], oversight: 'hitl', maxTokens: 8192, maxToolRounds: 15 },
-  architect: { prompt: 'prompts/architect.md', modelKey: 'local-reasoning', tools: ['mission-read','vault-read','arch-write','mission-write','d1-query','audit-query','file-read','file-list','grep-search','doc-read','agents-md-read','git-log','git-diff','notify-user','handoff-write','vault-list','bookmark-read','project-read','diagram-render'], oversight: 'hitl', maxTokens: 8192, maxToolRounds: 15 },
-  developer: { prompt: 'prompts/developer.md', modelKey: 'local-coding', tools: ['mission-read','vault-read','code-write','build-check','test-run','lint-check','type-check','migration-write','migration-check','file-read','file-list','grep-search','git-log','git-diff','git-branch-list','d1-query','doc-read','agents-md-read','notify-user','handoff-write','mission-write','artifact-write'], oversight: 'hitl', maxTokens: 8192, maxToolRounds: 20 },
-  qa: { prompt: 'prompts/qa.md', modelKey: 'local-reasoning', tools: ['mission-read','vault-read','file-read','file-list','grep-search','git-log','git-diff','d1-query','api-test','screenshot-capture','bundle-size','service-health','create-defect','notify-user','mission-write','handoff-write'], oversight: 'hitl', maxTokens: 8192, maxToolRounds: 15 },
-  devops: { prompt: 'prompts/devops.md', modelKey: 'local-background', tools: ['deploy-staging','deploy-production','rollback-deploy','service-health','logs-read','system-info','mission-read','d1-query','notify-user','mission-write','git-log','git-diff'], oversight: 'hitl', maxTokens: 4096, maxToolRounds: 10 },
-  'tech-writer': { prompt: 'prompts/tech-writer.md', modelKey: 'local-reasoning', tools: ['mission-read','vault-read','vault-write-agent','file-read','file-list','grep-search','doc-read','agents-md-read','prompt-read','artifact-write','mission-write','notify-user','git-log','handoff-write','vault-list','d1-query'], oversight: 'hitl', maxTokens: 8192, maxToolRounds: 15 },
+const AGENT_CONFIGS: Record<
+  string,
+  {
+    prompt: string;
+    modelKey: string;
+    tools: string[];
+    maxTokens: number;
+    oversight: string;
+    maxToolRounds: number;
+  }
+> = {
+  pm: {
+    prompt: 'prompts/pm.md',
+    modelKey: 'local-reasoning',
+    tools: [
+      'mission-read',
+      'vault-read',
+      'spec-write',
+      'mission-write',
+      'd1-query',
+      'audit-query',
+      'bookmark-read',
+      'project-read',
+      'vault-list',
+      'doc-read',
+      'handoff-write',
+      'notify-user',
+      'schedule-create',
+      'template-create',
+      'project-write',
+      'git-log',
+      'kv-read',
+      'pdf-generate',
+      'docx-generate',
+      'slides-generate',
+      'spreadsheet-generate',
+      'chart-render',
+      'gantt-render',
+      'html-report',
+    ],
+    oversight: 'hitl',
+    maxTokens: 8192,
+    maxToolRounds: 15,
+  },
+  architect: {
+    prompt: 'prompts/architect.md',
+    modelKey: 'local-reasoning',
+    tools: [
+      'mission-read',
+      'vault-read',
+      'arch-write',
+      'mission-write',
+      'd1-query',
+      'audit-query',
+      'file-read',
+      'file-list',
+      'grep-search',
+      'doc-read',
+      'agents-md-read',
+      'git-log',
+      'git-diff',
+      'notify-user',
+      'handoff-write',
+      'vault-list',
+      'bookmark-read',
+      'project-read',
+      'diagram-render',
+    ],
+    oversight: 'hitl',
+    maxTokens: 8192,
+    maxToolRounds: 15,
+  },
+  developer: {
+    prompt: 'prompts/developer.md',
+    modelKey: 'local-coding',
+    tools: [
+      'mission-read',
+      'vault-read',
+      'code-write',
+      'build-check',
+      'test-run',
+      'lint-check',
+      'type-check',
+      'migration-write',
+      'migration-check',
+      'file-read',
+      'file-list',
+      'grep-search',
+      'git-log',
+      'git-diff',
+      'git-branch-list',
+      'd1-query',
+      'doc-read',
+      'agents-md-read',
+      'notify-user',
+      'handoff-write',
+      'mission-write',
+      'artifact-write',
+    ],
+    oversight: 'hitl',
+    maxTokens: 8192,
+    maxToolRounds: 20,
+  },
+  qa: {
+    prompt: 'prompts/qa.md',
+    modelKey: 'local-reasoning',
+    tools: [
+      'mission-read',
+      'vault-read',
+      'file-read',
+      'file-list',
+      'grep-search',
+      'git-log',
+      'git-diff',
+      'd1-query',
+      'api-test',
+      'screenshot-capture',
+      'bundle-size',
+      'service-health',
+      'create-defect',
+      'notify-user',
+      'mission-write',
+      'handoff-write',
+    ],
+    oversight: 'hitl',
+    maxTokens: 8192,
+    maxToolRounds: 15,
+  },
+  devops: {
+    prompt: 'prompts/devops.md',
+    modelKey: 'local-background',
+    tools: [
+      'deploy-staging',
+      'deploy-production',
+      'rollback-deploy',
+      'service-health',
+      'logs-read',
+      'system-info',
+      'mission-read',
+      'd1-query',
+      'notify-user',
+      'mission-write',
+      'git-log',
+      'git-diff',
+    ],
+    oversight: 'hitl',
+    maxTokens: 4096,
+    maxToolRounds: 10,
+  },
+  'tech-writer': {
+    prompt: 'prompts/tech-writer.md',
+    modelKey: 'local-reasoning',
+    tools: [
+      'mission-read',
+      'vault-read',
+      'vault-write-agent',
+      'file-read',
+      'file-list',
+      'grep-search',
+      'doc-read',
+      'agents-md-read',
+      'prompt-read',
+      'artifact-write',
+      'mission-write',
+      'notify-user',
+      'git-log',
+      'handoff-write',
+      'vault-list',
+      'd1-query',
+    ],
+    oversight: 'hitl',
+    maxTokens: 8192,
+    maxToolRounds: 15,
+  },
 };
 
 const PROPOSAL_TYPES: Record<string, string> = {
@@ -246,7 +435,10 @@ async function executeToolCallback(
 /**
  * Run the agent loop: call LLM, execute tool calls, repeat until done.
  */
-async function runAgentLoop(req: AgentRunRequest, maxToolRounds?: number): Promise<AgentRunResponse> {
+async function runAgentLoop(
+  req: AgentRunRequest,
+  maxToolRounds?: number,
+): Promise<AgentRunResponse> {
   const maxRounds = maxToolRounds ?? MAX_TOOL_ROUNDS;
   const startTime = Date.now();
   let totalTokens = 0;
@@ -346,7 +538,9 @@ function loadAgentPrompt(promptPath: string): string {
 function loadToolDefs(toolNames: string[]): ToolDefinition[] {
   return toolNames.map((name) => {
     try {
-      return JSON.parse(readFileSync(join(AGENTS_BASE, 'tools', `${name}.json`), 'utf-8')) as ToolDefinition;
+      return JSON.parse(
+        readFileSync(join(AGENTS_BASE, 'tools', `${name}.json`), 'utf-8'),
+      ) as ToolDefinition;
     } catch (err) {
       log(`Warning: could not load tool definition for ${name}: ${err}`);
       return { name, description: `Tool ${name} (definition not found)` };
@@ -354,7 +548,11 @@ function loadToolDefs(toolNames: string[]): ToolDefinition[] {
   });
 }
 
-async function postResults(url: string, authToken: string, payload: unknown): Promise<void> {
+async function postResults(
+  url: string,
+  authToken: string,
+  payload: unknown,
+): Promise<void> {
   const delays = [1000, 2000, 4000];
   for (let attempt = 0; attempt <= delays.length; attempt++) {
     try {
@@ -362,7 +560,7 @@ async function postResults(url: string, authToken: string, payload: unknown): Pr
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${authToken}`,
+          Authorization: `Bearer ${authToken}`,
         },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(10_000),
@@ -377,7 +575,11 @@ async function postResults(url: string, authToken: string, payload: unknown): Pr
     }
   }
   // All retries failed — write to fallback file
-  const fallbackDir = join(process.env.HOME || '/root', 'Vibe Sphere', 'agent-results-fallback');
+  const fallbackDir = join(
+    process.env.HOME || '/root',
+    'Vibe Sphere',
+    'agent-results-fallback',
+  );
   mkdirSync(fallbackDir, { recursive: true });
   const p = payload as Record<string, unknown>;
   const filename = `${Date.now()}-${(p.missionId as string) || 'unknown'}.json`;
@@ -386,14 +588,33 @@ async function postResults(url: string, authToken: string, payload: unknown): Pr
 }
 
 async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
-  const { agent, missionId, pipelineStage, resultsUrl, resultsAuth, d1ProxyUrl, d1ProxyAuth } = req;
+  const {
+    agent,
+    missionId,
+    pipelineStage,
+    resultsUrl,
+    resultsAuth,
+    d1ProxyUrl,
+    d1ProxyAuth,
+  } = req;
 
   const agentConfig = AGENT_CONFIGS[agent];
   if (!agentConfig) {
     await postResults(resultsUrl, resultsAuth, {
-      missionId, pipelineStage, status: 'error',
-      errorCode: 'unknown_agent', errorMessage: `Unknown agent: ${agent}`,
-      auditEntries: [{ agentName: agent, actionType: 'agent_error', actionDetail: `Unknown agent: ${agent}`, target: 'builder-pipeline', result: 'failed' }],
+      missionId,
+      pipelineStage,
+      status: 'error',
+      errorCode: 'unknown_agent',
+      errorMessage: `Unknown agent: ${agent}`,
+      auditEntries: [
+        {
+          agentName: agent,
+          actionType: 'agent_error',
+          actionDetail: `Unknown agent: ${agent}`,
+          target: 'builder-pipeline',
+          result: 'failed',
+        },
+      ],
     });
     return;
   }
@@ -406,9 +627,18 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
     const tools = loadToolDefs(agentConfig.tools);
 
     // Import tool handlers dynamically from the agents package
-    const agentsPkgSrc = join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub', 'packages', 'agents', 'src');
+    const agentsPkgSrc = join(
+      process.env.HOME || '/root',
+      'Vibe Sphere',
+      'alacrity_hub',
+      'packages',
+      'agents',
+      'src',
+    );
 
-    let createToolHandlers: (deps: Record<string, unknown>) => Record<string, (params: Record<string, unknown>) => Promise<unknown>>;
+    let createToolHandlers: (
+      deps: Record<string, unknown>,
+    ) => Record<string, (params: Record<string, unknown>) => Promise<unknown>>;
     let createD1ProxyAdapter: (url: string, auth: string) => unknown;
     try {
       const thModule = await import(join(agentsPkgSrc, 'tool-handlers.js'));
@@ -417,9 +647,20 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
       createD1ProxyAdapter = d1Module.createD1ProxyAdapter;
     } catch (importErr) {
       await postResults(resultsUrl, resultsAuth, {
-        missionId, pipelineStage, status: 'error',
-        errorCode: 'import_error', errorMessage: `Failed to import tool handlers: ${String(importErr)}`,
-        auditEntries: [{ agentName: agent, actionType: 'agent_error', actionDetail: `Import error: ${String(importErr)}`, target: 'builder-pipeline', result: 'failed' }],
+        missionId,
+        pipelineStage,
+        status: 'error',
+        errorCode: 'import_error',
+        errorMessage: `Failed to import tool handlers: ${String(importErr)}`,
+        auditEntries: [
+          {
+            agentName: agent,
+            actionType: 'agent_error',
+            actionDetail: `Import error: ${String(importErr)}`,
+            target: 'builder-pipeline',
+            result: 'failed',
+          },
+        ],
       });
       return;
     }
@@ -433,14 +674,23 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
       tavilyApiKey: process.env.TAVILY_API_KEY || '',
       vaultIndexerUrl: process.env.VAULT_INDEXER_URL || 'http://127.0.0.1:3001',
       fetch: globalThis.fetch,
-      repoRoot: join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub'),
+      repoRoot: join(
+        process.env.HOME || '/root',
+        'Vibe Sphere',
+        'alacrity_hub',
+      ),
     };
     const toolHandlers = createToolHandlers(toolDeps);
 
     // Tool callback function for local execution
-    const toolCallback = async (toolName: string, params: Record<string, unknown>): Promise<string> => {
+    const toolCallback = async (
+      toolName: string,
+      params: Record<string, unknown>,
+    ): Promise<string> => {
       if (!agentConfig.tools.includes(toolName)) {
-        return JSON.stringify({ error: `Tool not allowed for agent ${agent}: ${toolName}` });
+        return JSON.stringify({
+          error: `Tool not allowed for agent ${agent}: ${toolName}`,
+        });
       }
       const handler = toolHandlers[toolName];
       if (!handler) {
@@ -463,7 +713,9 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         return;
       }
       let body = '';
-      cbReq.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+      cbReq.on('data', (chunk: Buffer) => {
+        body += chunk.toString();
+      });
       cbReq.on('end', async () => {
         try {
           const { tool, params } = JSON.parse(body);
@@ -472,7 +724,9 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
           cbRes.end(JSON.stringify({ result }));
         } catch (err) {
           cbRes.writeHead(500, { 'Content-Type': 'application/json' });
-          cbRes.end(JSON.stringify({ result: `Callback error: ${String(err)}` }));
+          cbRes.end(
+            JSON.stringify({ result: `Callback error: ${String(err)}` }),
+          );
         }
       });
     });
@@ -484,19 +738,22 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
 
     try {
       // Run the agent loop
-      const result = await runAgentLoop({
-        model: agentConfig.modelKey,
-        system_prompt: systemPrompt,
-        user_message: JSON.stringify({ missionId }),
-        tools,
-        max_tokens: agentConfig.maxTokens,
-        portkey: {
-          base_url: PORTKEY_BASE_URL,
-          api_key: PORTKEY_API_KEY,
-          virtual_key: agentConfig.modelKey,
+      const result = await runAgentLoop(
+        {
+          model: agentConfig.modelKey,
+          system_prompt: systemPrompt,
+          user_message: JSON.stringify({ missionId }),
+          tools,
+          max_tokens: agentConfig.maxTokens,
+          portkey: {
+            base_url: PORTKEY_BASE_URL,
+            api_key: PORTKEY_API_KEY,
+            virtual_key: agentConfig.modelKey,
+          },
+          tool_callback_url: `http://127.0.0.1:${callbackPort}/tool-callback`,
         },
-        tool_callback_url: `http://127.0.0.1:${callbackPort}/tool-callback`,
-      }, agentConfig.maxToolRounds);
+        agentConfig.maxToolRounds,
+      );
 
       const duration = Date.now() - startTime;
 
@@ -505,33 +762,58 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         missionId,
         pipelineStage,
         status: 'success',
-        auditEntries: [{
-          agentName: agent,
-          actionType: 'agent_complete',
-          actionDetail: `Agent completed in ${duration}ms`,
-          target: 'builder-pipeline',
-          result: 'success',
-          metadata: { tokensUsed: result.tokensUsed, model: result.model, duration },
-        }],
+        auditEntries: [
+          {
+            agentName: agent,
+            actionType: 'agent_complete',
+            actionDetail: `Agent completed in ${duration}ms`,
+            target: 'builder-pipeline',
+            result: 'success',
+            metadata: {
+              tokensUsed: result.tokensUsed,
+              model: result.model,
+              duration,
+            },
+          },
+        ],
       };
 
       // If HitL agent, construct proposal
       if (agentConfig.oversight === 'hitl') {
         let parsed: Record<string, unknown>;
-        try { parsed = JSON.parse(result.content); } catch { parsed = { raw: result.content }; }
+        try {
+          parsed = JSON.parse(result.content);
+        } catch {
+          parsed = { raw: result.content };
+        }
 
-        const agentBriefing = (parsed as Record<string, Record<string, string>>).briefing;
-        const briefing = agentBriefing ? {
-          whats_changing: agentBriefing.whats_changing || agentBriefing.whatsChanging || 'Agent proposal requires review',
-          why_now: agentBriefing.why_now || agentBriefing.whyNow || 'Triggered from builder-pipeline',
-          long_term_benefit: agentBriefing.long_term_benefit || agentBriefing.longTermBenefit || 'Maintains quality through human review',
-          risk_if_approved: agentBriefing.risk_if_approved || agentBriefing.riskIfApproved || 'Review the proposal details before approving',
-        } : {
-          whats_changing: 'Agent proposal requires review',
-          why_now: 'Triggered from builder-pipeline',
-          long_term_benefit: 'Maintains quality through human review',
-          risk_if_approved: 'Review the proposal details before approving',
-        };
+        const agentBriefing = (parsed as Record<string, Record<string, string>>)
+          .briefing;
+        const briefing = agentBriefing
+          ? {
+              whats_changing:
+                agentBriefing.whats_changing ||
+                agentBriefing.whatsChanging ||
+                'Agent proposal requires review',
+              why_now:
+                agentBriefing.why_now ||
+                agentBriefing.whyNow ||
+                'Triggered from builder-pipeline',
+              long_term_benefit:
+                agentBriefing.long_term_benefit ||
+                agentBriefing.longTermBenefit ||
+                'Maintains quality through human review',
+              risk_if_approved:
+                agentBriefing.risk_if_approved ||
+                agentBriefing.riskIfApproved ||
+                'Review the proposal details before approving',
+            }
+          : {
+              whats_changing: 'Agent proposal requires review',
+              why_now: 'Triggered from builder-pipeline',
+              long_term_benefit: 'Maintains quality through human review',
+              risk_if_approved: 'Review the proposal details before approving',
+            };
 
         resultPayload.proposal = {
           agentName: agent,
@@ -542,20 +824,30 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
       }
 
       await postResults(resultsUrl, resultsAuth, resultPayload);
-
     } finally {
       callbackServer.close();
     }
-
   } catch (err) {
     const duration = Date.now() - startTime;
     const isTimeout = err instanceof DOMException && err.name === 'AbortError';
 
     await postResults(resultsUrl, resultsAuth, {
-      missionId, pipelineStage, status: 'error',
+      missionId,
+      pipelineStage,
+      status: 'error',
       errorCode: isTimeout ? 'agent_timeout' : 'unknown',
-      errorMessage: isTimeout ? `Agent timed out after ${duration}ms` : `Agent failed: ${String(err)}`,
-      auditEntries: [{ agentName: agent, actionType: 'agent_error', actionDetail: String(err), target: 'builder-pipeline', result: 'failed' }],
+      errorMessage: isTimeout
+        ? `Agent timed out after ${duration}ms`
+        : `Agent failed: ${String(err)}`,
+      auditEntries: [
+        {
+          agentName: agent,
+          actionType: 'agent_error',
+          actionDetail: String(err),
+          target: 'builder-pipeline',
+          result: 'failed',
+        },
+      ],
     });
   }
 }
@@ -569,7 +861,10 @@ const server = createServer(async (req, res) => {
   // CORS for local development
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, CF-Access-Client-Id, CF-Access-Client-Secret');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, CF-Access-Client-Id, CF-Access-Client-Secret',
+  );
 
   if (method === 'OPTIONS') {
     res.writeHead(204);
@@ -609,26 +904,37 @@ const server = createServer(async (req, res) => {
       const virtualKey = request.virtual_key || 'local-reasoning';
       const resolvedModel = resolveModel(virtualKey);
 
-      log(`LLM proxy: virtual_key=${virtualKey}, model=${resolvedModel}, messages=${request.messages.length}`);
+      log(
+        `LLM proxy: virtual_key=${virtualKey}, model=${resolvedModel}, messages=${request.messages.length}`,
+      );
 
-      const portkeyRes = await fetch(`${PORTKEY_BASE_URL}/v1/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-portkey-provider': 'ollama',
-          'x-portkey-custom-host': OLLAMA_HOST,
-          ...(PORTKEY_API_KEY ? { Authorization: `Bearer ${PORTKEY_API_KEY}` } : {}),
-          ...(virtualKey ? { 'x-portkey-virtual-key': virtualKey } : {}),
-          ...(request.session_mode ? { 'x-portkey-session-mode': request.session_mode } : {}),
-          ...(request.pressure_level ? { 'x-portkey-pressure-level': request.pressure_level } : {}),
+      const portkeyRes = await fetch(
+        `${PORTKEY_BASE_URL}/v1/chat/completions`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-portkey-provider': 'ollama',
+            'x-portkey-custom-host': OLLAMA_HOST,
+            ...(PORTKEY_API_KEY
+              ? { Authorization: `Bearer ${PORTKEY_API_KEY}` }
+              : {}),
+            ...(virtualKey ? { 'x-portkey-virtual-key': virtualKey } : {}),
+            ...(request.session_mode
+              ? { 'x-portkey-session-mode': request.session_mode }
+              : {}),
+            ...(request.pressure_level
+              ? { 'x-portkey-pressure-level': request.pressure_level }
+              : {}),
+          },
+          body: JSON.stringify({
+            model: resolvedModel,
+            messages: request.messages,
+            temperature: request.temperature ?? 0.7,
+            max_tokens: request.max_tokens ?? 4096,
+          }),
         },
-        body: JSON.stringify({
-          model: resolvedModel,
-          messages: request.messages,
-          temperature: request.temperature ?? 0.7,
-          max_tokens: request.max_tokens ?? 4096,
-        }),
-      });
+      );
 
       if (!portkeyRes.ok) {
         const errorText = await portkeyRes.text().catch(() => 'unknown error');
@@ -665,10 +971,14 @@ const server = createServer(async (req, res) => {
       const scope = request.scope || 'both';
       const nResults = request.nResults || 5;
       const collections: string[] = [];
-      if (scope === 'human' || scope === 'both') collections.push('human-vault');
-      if (scope === 'agent' || scope === 'both') collections.push('agent-vault');
+      if (scope === 'human' || scope === 'both')
+        collections.push('human-vault');
+      if (scope === 'agent' || scope === 'both')
+        collections.push('agent-vault');
 
-      log(`RAG query: scope=${scope}, nResults=${nResults}, collections=${collections.join(',')}`);
+      log(
+        `RAG query: scope=${scope}, nResults=${nResults}, collections=${collections.join(',')}`,
+      );
 
       // Generate embedding via Ollama
       const embedRes = await fetch(`${OLLAMA_HOST}/api/embed`, {
@@ -714,7 +1024,9 @@ const server = createServer(async (req, res) => {
             );
 
             if (!queryRes.ok) {
-              log(`ChromaDB query failed for ${collectionName}: ${queryRes.status}`);
+              log(
+                `ChromaDB query failed for ${collectionName}: ${queryRes.status}`,
+              );
               return;
             }
 
@@ -740,7 +1052,10 @@ const server = createServer(async (req, res) => {
               allResults.push({
                 content: doc,
                 source: collectionName,
-                path: (meta?.path as string) || (meta?.source as string) || 'unknown',
+                path:
+                  (meta?.path as string) ||
+                  (meta?.source as string) ||
+                  'unknown',
                 agent: meta?.agent as string | undefined,
                 mission: meta?.mission as string | undefined,
                 contentType: meta?.contentType as string | undefined,
@@ -808,17 +1123,37 @@ const server = createServer(async (req, res) => {
       if (CF_ACCESS_EXPECTED_ID) {
         const clientId = req.headers['cf-access-client-id'];
         const clientSecret = req.headers['cf-access-client-secret'];
-        if (clientId !== CF_ACCESS_EXPECTED_ID || clientSecret !== CF_ACCESS_EXPECTED_SECRET) {
+        if (
+          clientId !== CF_ACCESS_EXPECTED_ID ||
+          clientSecret !== CF_ACCESS_EXPECTED_SECRET
+        ) {
           jsonResponse(res, 403, { error: 'Invalid CF Access credentials' });
           return;
         }
       }
 
       const body = JSON.parse(await readBody(req));
-      const { agent, missionId, pipelineStage, resultsUrl, resultsAuth, d1ProxyUrl, d1ProxyAuth } = body;
+      const {
+        agent,
+        missionId,
+        pipelineStage,
+        resultsUrl,
+        resultsAuth,
+        d1ProxyUrl,
+        d1ProxyAuth,
+      } = body;
 
-      if (!agent || !missionId || !pipelineStage || !resultsUrl || !resultsAuth) {
-        jsonResponse(res, 400, { error: 'Missing required fields: agent, missionId, pipelineStage, resultsUrl, resultsAuth' });
+      if (
+        !agent ||
+        !missionId ||
+        !pipelineStage ||
+        !resultsUrl ||
+        !resultsAuth
+      ) {
+        jsonResponse(res, 400, {
+          error:
+            'Missing required fields: agent, missionId, pipelineStage, resultsUrl, resultsAuth',
+        });
         return;
       }
 
@@ -827,8 +1162,17 @@ const server = createServer(async (req, res) => {
 
       // Spawn background execution
       setImmediate(() => {
-        runAsyncAgent({ agent, missionId, pipelineStage, resultsUrl, resultsAuth, d1ProxyUrl: d1ProxyUrl || '', d1ProxyAuth: d1ProxyAuth || '' })
-          .catch((err) => log(`Async agent error for ${agent}/${missionId}: ${err}`));
+        runAsyncAgent({
+          agent,
+          missionId,
+          pipelineStage,
+          resultsUrl,
+          resultsAuth,
+          d1ProxyUrl: d1ProxyUrl || '',
+          d1ProxyAuth: d1ProxyAuth || '',
+        }).catch((err) =>
+          log(`Async agent error for ${agent}/${missionId}: ${err}`),
+        );
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -857,10 +1201,16 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const intakeDir = join(process.env.HOME ?? '/root', 'Vibe Sphere', 'mission-intake');
+      const intakeDir = join(
+        process.env.HOME ?? '/root',
+        'Vibe Sphere',
+        'mission-intake',
+      );
       mkdirSync(intakeDir, { recursive: true });
 
-      const date = intake.created_at?.slice(0, 10) ?? new Date().toISOString().slice(0, 10);
+      const date =
+        intake.created_at?.slice(0, 10) ??
+        new Date().toISOString().slice(0, 10);
       const slug = intake.title
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
@@ -871,8 +1221,11 @@ const server = createServer(async (req, res) => {
       const filepath = join(intakeDir, filename);
 
       const workTypeLabel =
-        intake.work_type === 'new-sub-app' ? 'New Sub-App' :
-        intake.work_type === 'fix' ? 'Fix' : 'Enhancement';
+        intake.work_type === 'new-sub-app'
+          ? 'New Sub-App'
+          : intake.work_type === 'fix'
+            ? 'Fix'
+            : 'Enhancement';
 
       const md = [
         '---',
@@ -890,13 +1243,17 @@ const server = createServer(async (req, res) => {
         '',
         `**Type:** ${workTypeLabel}`,
         intake.app_area ? `**Area:** ${intake.app_area}` : null,
-        intake.target_component ? `**Component:** ${intake.target_component}` : null,
+        intake.target_component
+          ? `**Component:** ${intake.target_component}`
+          : null,
         '',
         '## Description',
         '',
         intake.description || '_No description provided._',
         '',
-      ].filter((line) => line !== null).join('\n');
+      ]
+        .filter((line) => line !== null)
+        .join('\n');
 
       writeFileSync(filepath, md, 'utf-8');
       log(`Mission intake written: ${filename}`);
