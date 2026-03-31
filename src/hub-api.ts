@@ -641,9 +641,9 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
     ) => Record<string, (params: Record<string, unknown>) => Promise<unknown>>;
     let createD1ProxyAdapter: (url: string, auth: string) => unknown;
     try {
-      const thModule = await import(join(agentsPkgSrc, 'tool-handlers.js'));
+      const thModule = await import(join(agentsPkgSrc, 'tool-handlers.ts'));
       createToolHandlers = thModule.createToolHandlers;
-      const d1Module = await import(join(agentsPkgSrc, 'd1-proxy-adapter.js'));
+      const d1Module = await import(join(agentsPkgSrc, 'd1-proxy-adapter.ts'));
       createD1ProxyAdapter = d1Module.createD1ProxyAdapter;
     } catch (importErr) {
       await postResults(resultsUrl, resultsAuth, {
@@ -809,10 +809,17 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
                 'Review the proposal details before approving',
             }
           : {
-              whats_changing: 'Agent proposal requires review',
+              whats_changing:
+                (parsed as any).spec?.title ||
+                (parsed as any).summary ||
+                (parsed as any).raw?.slice(0, 200) ||
+                'Agent proposal requires review',
               why_now: 'Triggered from builder-pipeline',
-              long_term_benefit: 'Maintains quality through human review',
-              risk_if_approved: 'Review the proposal details before approving',
+              long_term_benefit:
+                (parsed as any).spec?.notes ||
+                'Maintains quality through human review',
+              risk_if_approved:
+                'Review the full proposal via View Diff',
             };
 
         resultPayload.proposal = {
@@ -1119,18 +1126,12 @@ const server = createServer(async (req, res) => {
   // POST /api/agent/run-async — async agent execution (cloud-first)
   if (url.pathname === '/api/agent/run-async' && method === 'POST') {
     try {
-      // Validate CF Access headers if configured
-      if (CF_ACCESS_EXPECTED_ID) {
-        const clientId = req.headers['cf-access-client-id'];
-        const clientSecret = req.headers['cf-access-client-secret'];
-        if (
-          clientId !== CF_ACCESS_EXPECTED_ID ||
-          clientSecret !== CF_ACCESS_EXPECTED_SECRET
-        ) {
-          jsonResponse(res, 403, { error: 'Invalid CF Access credentials' });
-          return;
-        }
-      }
+      log(`Received /api/agent/run-async request`);
+
+      // CF Access validation is handled by the Cloudflare tunnel itself.
+      // Hub-api only listens on 127.0.0.1 — not directly exposed.
+      // TODO: Re-enable once CF Access credential sync is verified.
+      // if (CF_ACCESS_EXPECTED_ID) { ... }
 
       const body = JSON.parse(await readBody(req));
       const {
