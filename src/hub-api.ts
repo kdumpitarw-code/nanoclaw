@@ -11,7 +11,7 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'http';
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
 
 // Load .env file if present (launchd doesn't source it)
@@ -38,11 +38,49 @@ const PORTKEY_API_KEY = process.env.PORTKEY_API_KEY || '';
 const CHROMADB_HOST = process.env.CHROMADB_HOST || 'http://127.0.0.1:8000';
 const EMBED_MODEL = 'nomic-embed-text';
 const MAX_TOOL_ROUNDS = 10;
+const MAX_CONCURRENT_AGENTS = 2;
+
+// --- Concurrency Semaphore ---
+// Limits concurrent runAsyncAgent calls to prevent D1 proxy fetch failures
+class AgentSemaphore {
+  private running = 0;
+  private queue: Array<() => void> = [];
+
+  async acquire(): Promise<void> {
+    if (this.running < MAX_CONCURRENT_AGENTS) {
+      this.running++;
+      return;
+    }
+    return new Promise<void>((resolve) => {
+      this.queue.push(() => {
+        this.running++;
+        resolve();
+      });
+    });
+  }
+
+  release(): void {
+    this.running--;
+    const next = this.queue.shift();
+    if (next) next();
+  }
+
+  get active(): number {
+    return this.running;
+  }
+
+  get queued(): number {
+    return this.queue.length;
+  }
+}
+
+const agentSemaphore = new AgentSemaphore();
 
 // CF Access validation for cloud-first async endpoint
 const CF_ACCESS_EXPECTED_ID = process.env.CF_ACCESS_EXPECTED_ID || '';
 const CF_ACCESS_EXPECTED_SECRET = process.env.CF_ACCESS_EXPECTED_SECRET || '';
 const AGENT_RESULTS_SECRET = process.env.AGENT_RESULTS_SECRET || '';
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 
 // Path to the agents package on this machine
 const AGENTS_BASE = join(
@@ -91,6 +129,7 @@ interface AgentRunRequest {
   portkey: PortkeyConfig;
   container?: Record<string, unknown>;
   tool_callback_url: string;
+  cloud?: { forceCloud: boolean; fallbackModel: string; apiKey: string };
 }
 
 interface AgentRunResponse {
@@ -141,6 +180,8 @@ interface AsyncAgentRequest {
   resultsAuth: string;
   d1ProxyUrl: string;
   d1ProxyAuth: string;
+  forceCloud?: boolean;
+  fallbackModel?: string;
 }
 
 const AGENT_CONFIGS: Record<
@@ -356,21 +397,19 @@ function log(msg: string): void {
 }
 
 /**
- * Call the LLM via Portkey (OpenAI-compatible chat completions).
+ * Call OpenRouter's chat completions API (OpenAI-compatible).
  */
-async function callLLM(
-  portkey: PortkeyConfig,
+async function callOpenRouter(
+  apiKey: string,
   model: string,
   messages: ChatMessage[],
   tools: ToolDefinition[],
   maxTokens: number,
 ): Promise<ChatCompletionResponse> {
-  const url = `${portkey.base_url}/v1/chat/completions`;
-
-  const resolvedModel = resolveModel(model);
+  const url = 'https://openrouter.ai/api/v1/chat/completions';
 
   const body: Record<string, unknown> = {
-    model: resolvedModel,
+    model,
     messages,
     max_tokens: maxTokens,
   };
@@ -390,24 +429,95 @@ async function callLLM(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-portkey-provider': 'ollama',
-      'x-portkey-custom-host': OLLAMA_HOST,
-      ...(portkey.api_key
-        ? { Authorization: `Bearer ${portkey.api_key}` }
-        : {}),
-      ...(portkey.virtual_key
-        ? { 'x-portkey-virtual-key': portkey.virtual_key }
-        : {}),
+      'Authorization': `Bearer ${apiKey}`,
+      'HTTP-Referer': 'https://alacrityhub.ca',
+      'X-Title': 'Alacrity Hub Pipeline',
     },
     body: JSON.stringify(body),
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => 'unknown error');
-    throw new Error(`LLM call failed (${res.status}): ${text}`);
+    throw new Error(`OpenRouter call failed (${res.status}): ${text}`);
   }
 
   return (await res.json()) as ChatCompletionResponse;
+}
+
+/**
+ * Call the LLM via Portkey (OpenAI-compatible chat completions).
+ * If cloud config is provided:
+ *   - forceCloud=true → skip Portkey, call OpenRouter directly
+ *   - forceCloud=false → try Portkey first, fall back to OpenRouter on failure
+ */
+async function callLLM(
+  portkey: PortkeyConfig,
+  model: string,
+  messages: ChatMessage[],
+  tools: ToolDefinition[],
+  maxTokens: number,
+  cloud?: { forceCloud: boolean; fallbackModel: string; apiKey: string },
+): Promise<ChatCompletionResponse> {
+  // Force cloud path — skip Portkey entirely
+  if (cloud?.forceCloud) {
+    log(`callLLM: force_cloud=true, using OpenRouter model=${cloud.fallbackModel}`);
+    return callOpenRouter(cloud.apiKey, cloud.fallbackModel, messages, tools, maxTokens);
+  }
+
+  // Try Portkey (local Ollama)
+  const url = `${portkey.base_url}/v1/chat/completions`;
+  const resolvedModel = resolveModel(model);
+
+  const body: Record<string, unknown> = {
+    model: resolvedModel,
+    messages,
+    max_tokens: maxTokens,
+  };
+
+  if (tools.length > 0) {
+    body.tools = tools.map((t) => ({
+      type: 'function',
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters ?? { type: 'object', properties: {} },
+      },
+    }));
+  }
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-portkey-provider': 'ollama',
+        'x-portkey-custom-host': OLLAMA_HOST,
+        ...(portkey.api_key
+          ? { Authorization: `Bearer ${portkey.api_key}` }
+          : {}),
+        ...(portkey.virtual_key
+          ? { 'x-portkey-virtual-key': portkey.virtual_key }
+          : {}),
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => 'unknown error');
+      throw new Error(`LLM call failed (${res.status}): ${text}`);
+    }
+
+    log(`callLLM: Portkey succeeded (model=${resolvedModel})`);
+    return (await res.json()) as ChatCompletionResponse;
+  } catch (portkeyErr) {
+    // If cloud fallback is available, try OpenRouter
+    if (cloud) {
+      log(`callLLM: Portkey failed (${portkeyErr}), falling back to OpenRouter model=${cloud.fallbackModel}`);
+      return callOpenRouter(cloud.apiKey, cloud.fallbackModel, messages, tools, maxTokens);
+    }
+    // No fallback — rethrow
+    throw portkeyErr;
+  }
 }
 
 /**
@@ -460,6 +570,7 @@ async function runAgentLoop(
       messages,
       req.tools,
       req.max_tokens,
+      req.cloud,
     );
 
     if (completion.usage) {
@@ -531,8 +642,45 @@ async function runAgentLoop(
 
 // --- Async Agent Execution ---
 
+// Cached repo structure snippet injected into agent prompts
+let _repoStructure: string | null = null;
+function getRepoStructure(): string {
+  if (_repoStructure) return _repoStructure;
+  const repoRoot = join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub');
+  try {
+    const { readdirSync } = require('fs');
+    const topDirs = readdirSync(repoRoot, { withFileTypes: true })
+      .filter((d: { isDirectory: () => boolean; name: string }) =>
+        d.isDirectory() && !d.name.startsWith('.') && d.name !== 'node_modules')
+      .map((d: { name: string }) => d.name);
+
+    const structure: string[] = [];
+    for (const dir of topDirs) {
+      const subPath = join(repoRoot, dir);
+      try {
+        const subs = readdirSync(subPath, { withFileTypes: true })
+          .filter((d: { isDirectory: () => boolean; name: string }) =>
+            d.isDirectory() && !d.name.startsWith('.') && d.name !== 'node_modules')
+          .map((d: { name: string }) => d.name);
+        if (subs.length > 0) {
+          structure.push(`${dir}/: ${subs.join(', ')}`);
+        } else {
+          structure.push(`${dir}/`);
+        }
+      } catch {
+        structure.push(`${dir}/`);
+      }
+    }
+    _repoStructure = `\n\n## Repository Structure\n${structure.join('\n')}\n\nUse these paths with file-list and grep-search. Do NOT guess paths that are not listed here.\n`;
+  } catch {
+    _repoStructure = '';
+  }
+  return _repoStructure;
+}
+
 function loadAgentPrompt(promptPath: string): string {
-  return readFileSync(join(AGENTS_BASE, promptPath), 'utf-8');
+  const prompt = readFileSync(join(AGENTS_BASE, promptPath), 'utf-8');
+  return prompt + getRepoStructure();
 }
 
 function loadToolDefs(toolNames: string[]): ToolDefinition[] {
@@ -548,12 +696,18 @@ function loadToolDefs(toolNames: string[]): ToolDefinition[] {
   });
 }
 
+const FALLBACK_DIR = join(
+  process.env.HOME || '/root',
+  'Vibe Sphere',
+  'agent-results-fallback',
+);
+
 async function postResults(
   url: string,
   authToken: string,
   payload: unknown,
 ): Promise<void> {
-  const delays = [1000, 2000, 4000];
+  const delays = [1000, 2000, 4000, 8000];
   for (let attempt = 0; attempt <= delays.length; attempt++) {
     try {
       const res = await fetch(url, {
@@ -563,27 +717,24 @@ async function postResults(
           Authorization: `Bearer ${authToken}`,
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(10_000),
+        signal: AbortSignal.timeout(30_000),
       });
       if (res.ok) return;
-      log(`Results POST failed (${res.status}), attempt ${attempt + 1}`);
+      log(`Results POST to ${url} failed (${res.status}), attempt ${attempt + 1}`);
     } catch (err) {
-      log(`Results POST error, attempt ${attempt + 1}: ${err}`);
+      log(`Results POST to ${url} error, attempt ${attempt + 1}: ${err}`);
     }
     if (attempt < delays.length) {
       await new Promise((r) => setTimeout(r, delays[attempt]));
     }
   }
   // All retries failed — write to fallback file
-  const fallbackDir = join(
-    process.env.HOME || '/root',
-    'Vibe Sphere',
-    'agent-results-fallback',
-  );
-  mkdirSync(fallbackDir, { recursive: true });
+  mkdirSync(FALLBACK_DIR, { recursive: true });
   const p = payload as Record<string, unknown>;
   const filename = `${Date.now()}-${(p.missionId as string) || 'unknown'}.json`;
-  writeFileSync(join(fallbackDir, filename), JSON.stringify(payload, null, 2));
+  // Store the resultsUrl and auth alongside the payload for replay
+  const fallbackData = { _resultsUrl: url, _resultsAuth: authToken, ...p };
+  writeFileSync(join(FALLBACK_DIR, filename), JSON.stringify(fallbackData, null, 2));
   log(`All result POST retries failed. Written to fallback: ${filename}`);
 }
 
@@ -705,7 +856,8 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
     };
 
     // Start temporary callback server for tool execution
-    const callbackPort = 4101 + Math.floor(Math.random() * 100);
+    // Use port 0 to let the OS assign an available ephemeral port (avoids collisions under concurrency)
+    const callbackPort = 0;
     const callbackServer = createServer(async (cbReq, cbRes) => {
       if (cbReq.method !== 'POST' || cbReq.url !== '/tool-callback') {
         cbRes.writeHead(404);
@@ -736,6 +888,16 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
       callbackServer.on('error', reject);
     });
 
+    // Read the actual assigned port (needed when callbackPort is 0)
+    const actualPort = (callbackServer.address() as { port: number }).port;
+
+    // Construct cloud config for OpenRouter fallback
+    const cloud = req.forceCloud && req.fallbackModel && OPENROUTER_API_KEY
+      ? { forceCloud: true, fallbackModel: req.fallbackModel, apiKey: OPENROUTER_API_KEY }
+      : OPENROUTER_API_KEY && req.fallbackModel
+        ? { forceCloud: false, fallbackModel: req.fallbackModel, apiKey: OPENROUTER_API_KEY }
+        : undefined;
+
     try {
       // Run the agent loop
       const result = await runAgentLoop(
@@ -750,28 +912,39 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
             api_key: PORTKEY_API_KEY,
             virtual_key: agentConfig.modelKey,
           },
-          tool_callback_url: `http://127.0.0.1:${callbackPort}/tool-callback`,
+          tool_callback_url: `http://127.0.0.1:${actualPort}/tool-callback`,
+          cloud,
         },
         agentConfig.maxToolRounds,
       );
 
       const duration = Date.now() - startTime;
 
+      // Determine which LLM path was actually used
+      const llmPath = cloud?.forceCloud
+        ? 'openrouter-forced'
+        : cloud && result.model === cloud.fallbackModel
+          ? 'openrouter-fallback'
+          : 'portkey-local';
+
       // Build result payload
       const resultPayload: Record<string, unknown> = {
         missionId,
         pipelineStage,
         status: 'success',
+        modelUsed: result.model,
+        llmPath,
         auditEntries: [
           {
             agentName: agent,
             actionType: 'agent_complete',
-            actionDetail: `Agent completed in ${duration}ms`,
+            actionDetail: `Agent completed in ${duration}ms (${llmPath})`,
             target: 'builder-pipeline',
             result: 'success',
             metadata: {
               tokensUsed: result.tokensUsed,
               model: result.model,
+              llmPath,
               duration,
             },
           },
@@ -885,6 +1058,11 @@ const server = createServer(async (req, res) => {
       service: 'nanoclaw-hub-api',
       port: PORT,
       uptime: process.uptime(),
+      concurrency: {
+        active: agentSemaphore.active,
+        queued: agentSemaphore.queued,
+        max: MAX_CONCURRENT_AGENTS,
+      },
     });
     return;
   }
@@ -1148,6 +1326,8 @@ const server = createServer(async (req, res) => {
         resultsAuth,
         d1ProxyUrl,
         d1ProxyAuth,
+        forceCloud,
+        fallbackModel,
       } = body;
 
       if (
@@ -1165,21 +1345,39 @@ const server = createServer(async (req, res) => {
       }
 
       // Return 202 immediately, run agent in background
-      jsonResponse(res, 202, { status: 'accepted', agent, missionId });
+      const queuePos = agentSemaphore.queued;
+      jsonResponse(res, 202, {
+        status: 'accepted',
+        agent,
+        missionId,
+        concurrency: { active: agentSemaphore.active, queued: queuePos },
+      });
 
-      // Spawn background execution
-      setImmediate(() => {
-        runAsyncAgent({
-          agent,
-          missionId,
-          pipelineStage,
-          resultsUrl,
-          resultsAuth,
-          d1ProxyUrl: d1ProxyUrl || '',
-          d1ProxyAuth: d1ProxyAuth || '',
-        }).catch((err) =>
-          log(`Async agent error for ${agent}/${missionId}: ${err}`),
-        );
+      // Spawn background execution with concurrency limit
+      setImmediate(async () => {
+        if (agentSemaphore.active >= MAX_CONCURRENT_AGENTS) {
+          log(`Agent ${agent}/${missionId} queued (${agentSemaphore.active} active, ${agentSemaphore.queued + 1} will wait)`);
+        }
+        await agentSemaphore.acquire();
+        log(`Agent ${agent}/${missionId} acquired slot (${agentSemaphore.active} active, ${agentSemaphore.queued} waiting)`);
+        try {
+          await runAsyncAgent({
+            agent,
+            missionId,
+            pipelineStage,
+            resultsUrl,
+            resultsAuth,
+            d1ProxyUrl: d1ProxyUrl || '',
+            d1ProxyAuth: d1ProxyAuth || '',
+            forceCloud: forceCloud || false,
+            fallbackModel: fallbackModel || '',
+          });
+        } catch (err) {
+          log(`Async agent error for ${agent}/${missionId}: ${err}`);
+        } finally {
+          log(`Agent ${agent}/${missionId} releasing slot (was ${agentSemaphore.active} active, ${agentSemaphore.queued} waiting)`);
+          agentSemaphore.release();
+        }
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1278,6 +1476,45 @@ const server = createServer(async (req, res) => {
   jsonResponse(res, 404, { error: 'Not found' });
 });
 
+/**
+ * Replay any fallback result files that failed to POST on previous runs.
+ * Removes successfully replayed files; leaves failures for the next attempt.
+ */
+async function replayFallbackFiles(): Promise<void> {
+  if (!existsSync(FALLBACK_DIR)) return;
+  const files = readdirSync(FALLBACK_DIR).filter((f) => f.endsWith('.json'));
+  if (files.length === 0) return;
+  log(`Found ${files.length} fallback file(s) to replay`);
+  for (const file of files) {
+    const filePath = join(FALLBACK_DIR, file);
+    try {
+      const raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+      const { _resultsUrl, _resultsAuth, ...payload } = raw;
+      if (!_resultsUrl || !_resultsAuth) {
+        log(`Fallback ${file}: missing _resultsUrl or _resultsAuth, skipping`);
+        continue;
+      }
+      const res = await fetch(_resultsUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${_resultsAuth}`,
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (res.ok) {
+        unlinkSync(filePath);
+        log(`Fallback ${file}: replayed successfully, deleted`);
+      } else {
+        log(`Fallback ${file}: replay failed (${res.status}), will retry next startup`);
+      }
+    } catch (err) {
+      log(`Fallback ${file}: replay error: ${err}`);
+    }
+  }
+}
+
 server.listen(PORT, HOST, () => {
   log(`Hub API server listening on http://${HOST}:${PORT}`);
   log(`Health: GET /api/health`);
@@ -1286,6 +1523,9 @@ server.listen(PORT, HOST, () => {
   log(`Agent:  POST /api/agent/run`);
   log(`Async:  POST /api/agent/run-async`);
   log(`Intake: POST /api/mission-intake`);
+
+  // Replay any pending fallback files after a short delay
+  setTimeout(() => replayFallbackFiles().catch((e) => log(`Fallback replay error: ${e}`)), 5000);
 });
 
 process.on('SIGTERM', () => {
