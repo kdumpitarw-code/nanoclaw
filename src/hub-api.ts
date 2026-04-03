@@ -544,7 +544,8 @@ async function handleInterceptedTool(
     if (summary.length > 800) {
       const truncated = summary.slice(0, 800);
       const lastSentence = truncated.lastIndexOf('.');
-      summary = lastSentence > 400 ? truncated.slice(0, lastSentence + 1) : truncated;
+      summary =
+        lastSentence > 400 ? truncated.slice(0, lastSentence + 1) : truncated;
     }
     return JSON.stringify({
       result: 'Checkpoint marked complete.',
@@ -556,7 +557,8 @@ async function handleInterceptedTool(
   if (toolName === 'preflight_rerun') {
     // Re-run preflight script
     const scriptPath = join(
-      process.env.HUB_ROOT ?? join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub'),
+      process.env.HUB_ROOT ??
+        join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub'),
       'scripts',
       'preflight.sh',
     );
@@ -679,6 +681,317 @@ async function runAgentLoop(
     model: req.model,
     tokensUsed: totalTokens,
     duration: Date.now() - startTime,
+  };
+}
+
+// --- Checkpoint-aware execution helpers ---
+
+interface StageCheckpoint {
+  id: number;
+  mission_id: string;
+  stage: string;
+  checkpoint_index: number;
+  description: string;
+  status: 'pending' | 'in_progress' | 'completed' | 'failed';
+  output_summary: string | null;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  tokens_used: number;
+  tool_rounds_used: number;
+  model_used: string | null;
+  routing_reason: string | null;
+}
+
+async function fetchCheckpoints(
+  d1ProxyUrl: string,
+  d1ProxyAuth: string,
+  missionId: string,
+  stage: string,
+): Promise<StageCheckpoint[]> {
+  try {
+    const res = await fetch(d1ProxyUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${d1ProxyAuth}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sql: 'SELECT * FROM stage_checkpoints WHERE mission_id = ? AND stage = ? ORDER BY checkpoint_index ASC',
+        params: [missionId, stage],
+      }),
+    });
+    const data = (await res.json()) as { results?: StageCheckpoint[] };
+    return data.results ?? [];
+  } catch (err) {
+    log(`fetchCheckpoints error: ${err}`);
+    return [];
+  }
+}
+
+async function updateCheckpoint(
+  d1ProxyUrl: string,
+  d1ProxyAuth: string,
+  missionId: string,
+  stage: string,
+  index: number,
+  updates: Partial<StageCheckpoint>,
+): Promise<void> {
+  try {
+    const setClauses = Object.keys(updates).map((k) => `${k} = ?`).join(', ');
+    const values = Object.values(updates);
+    await fetch(d1ProxyUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${d1ProxyAuth}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sql: `UPDATE stage_checkpoints SET ${setClauses} WHERE mission_id = ? AND stage = ? AND checkpoint_index = ?`,
+        params: [...values, missionId, stage, index],
+      }),
+    });
+  } catch (err) {
+    log(`updateCheckpoint error: ${err}`);
+  }
+}
+
+interface RoutingDecision {
+  route: 'local' | 'cloud';
+  reason: string;
+}
+
+async function decideRouting(forceCloud: boolean): Promise<RoutingDecision> {
+  if (forceCloud) return { route: 'cloud', reason: 'force_cloud' };
+
+  // Check memory pressure from state file
+  try {
+    const pressureFile = join(
+      process.env.HOME ?? '/root',
+      'Vibe Sphere',
+      'alacrity_hub',
+      '.memory-pressure-state',
+    );
+    const pressure = readFileSync(pressureFile, 'utf-8').trim();
+    if (pressure === 'critical') return { route: 'cloud', reason: 'memory_pressure' };
+  } catch {
+    // File doesn't exist, continue
+  }
+
+  // Ping Ollama
+  try {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 500);
+    await fetch(`${OLLAMA_HOST}/api/tags`, { signal: controller.signal });
+    return { route: 'local', reason: 'local_healthy' };
+  } catch {
+    return { route: 'cloud', reason: 'ollama_timeout' };
+  }
+}
+
+/**
+ * Run agent with checkpoint-aware segmented execution.
+ * Each checkpoint runs with a fresh context, carrying forward only compact summaries.
+ */
+async function runCheckpointAwareAgent(
+  req: AsyncAgentRequest,
+  agentConfig: NanoClawAgentConfig,
+  toolCallback: (toolName: string, params: Record<string, unknown>) => Promise<string>,
+  actualCallbackPort: number,
+  cloud?: { forceCloud: boolean; fallbackModel: string; apiKey: string },
+): Promise<{
+  content: string;
+  model: string;
+  tokensUsed: number;
+  duration: number;
+  checkpointResults: Array<{ index: number; status: string; summary?: string }>;
+}> {
+  const startTime = Date.now();
+  let totalTokens = 0;
+  const checkpointResults: Array<{ index: number; status: string; summary?: string }> = [];
+
+  // Load checkpoints from D1
+  const checkpoints = await fetchCheckpoints(
+    req.d1ProxyUrl,
+    req.d1ProxyAuth,
+    req.missionId,
+    req.pipelineStage,
+  );
+
+  // If no checkpoints, fall back to standard agent loop
+  if (checkpoints.length === 0) {
+    log('No checkpoints found, falling back to standard agent loop');
+    const result = await runAgentLoop(
+      {
+        model: agentConfig.modelKey,
+        system_prompt: '', // Will be set below
+        user_message: JSON.stringify({ missionId: req.missionId }),
+        tools: [], // Will be set below
+        max_tokens: agentConfig.maxTokens,
+        portkey: {
+          base_url: PORTKEY_BASE_URL,
+          api_key: PORTKEY_API_KEY,
+          virtual_key: agentConfig.modelKey,
+        },
+        tool_callback_url: `http://127.0.0.1:${actualCallbackPort}/tool-callback`,
+        cloud,
+      },
+      agentConfig.maxToolRounds,
+    );
+    return { ...result, checkpointResults: [] };
+  }
+
+  // Load system prompt and tools
+  const promptPath = agentConfig.prompt;
+  let systemPrompt = loadAgentPrompt(promptPath);
+  if (req.language && req.language !== 'English') {
+    systemPrompt += `\n\nAlways respond in ${req.language}. Do not switch languages unless the user explicitly asks.`;
+  }
+  const tools = loadToolDefs(agentConfig.tools);
+
+  // Execute each checkpoint
+  for (let i = 0; i < checkpoints.length; i++) {
+    const checkpoint = checkpoints[i];
+
+    // Skip completed checkpoints (for resume)
+    if (checkpoint.status === 'completed') {
+      checkpointResults.push({
+        index: checkpoint.checkpoint_index,
+        status: 'completed',
+        summary: checkpoint.output_summary ?? undefined,
+      });
+      continue;
+    }
+
+    // Mark as in_progress
+    await updateCheckpoint(
+      req.d1ProxyUrl,
+      req.d1ProxyAuth,
+      req.missionId,
+      req.pipelineStage,
+      checkpoint.checkpoint_index,
+      { status: 'in_progress', started_at: new Date().toISOString() },
+    );
+
+    // Routing decision
+    const routing = await decideRouting(cloud?.forceCloud ?? false);
+    const useCloud = routing.route === 'cloud';
+
+    // Build context with prior summaries
+    const priorSummaries = checkpointResults
+      .filter((r) => r.summary)
+      .map((r) => `Checkpoint ${r.index}: ${r.summary}`)
+      .join('\n');
+
+    const checkpointPrompt = `${systemPrompt}
+
+## Prior Progress
+${priorSummaries || '(No prior checkpoints)'}
+
+## Current Checkpoint
+${checkpoint.description}
+
+Complete this checkpoint and call checkpoint_complete with a concise summary.`;
+
+    const checkpointCloud = useCloud
+      ? { forceCloud: true, fallbackModel: cloud!.fallbackModel, apiKey: cloud!.apiKey }
+      : cloud;
+
+    try {
+      const result = await runAgentLoop(
+        {
+          model: agentConfig.modelKey,
+          system_prompt: checkpointPrompt,
+          user_message: JSON.stringify({ missionId: req.missionId }),
+          tools,
+          max_tokens: agentConfig.maxTokens,
+          portkey: {
+            base_url: PORTKEY_BASE_URL,
+            api_key: PORTKEY_API_KEY,
+            virtual_key: agentConfig.modelKey,
+          },
+          tool_callback_url: `http://127.0.0.1:${actualCallbackPort}/tool-callback`,
+          cloud: checkpointCloud,
+        },
+        agentConfig.maxToolRounds,
+      );
+
+      totalTokens += result.tokensUsed;
+
+      // Extract summary from checkpoint_complete result if present
+      let summary = '';
+      try {
+        const parsed = JSON.parse(result.content);
+        summary = parsed.summary || result.content.slice(0, 200);
+      } catch {
+        summary = result.content.slice(0, 200);
+      }
+
+      // Mark checkpoint completed
+      await updateCheckpoint(
+        req.d1ProxyUrl,
+        req.d1ProxyAuth,
+        req.missionId,
+        req.pipelineStage,
+        checkpoint.checkpoint_index,
+        {
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          output_summary: summary,
+          tokens_used: result.tokensUsed,
+          model_used: result.model,
+          routing_reason: routing.reason,
+        },
+      );
+
+      checkpointResults.push({
+        index: checkpoint.checkpoint_index,
+        status: 'completed',
+        summary,
+      });
+    } catch (err) {
+      // Mark checkpoint failed
+      await updateCheckpoint(
+        req.d1ProxyUrl,
+        req.d1ProxyAuth,
+        req.missionId,
+        req.pipelineStage,
+        checkpoint.checkpoint_index,
+        {
+          status: 'failed',
+          error: String(err),
+        },
+      );
+
+      checkpointResults.push({
+        index: checkpoint.checkpoint_index,
+        status: 'failed',
+      });
+
+      // Return partial results
+      return {
+        content: `Checkpoint ${checkpoint.checkpoint_index} failed: ${err}`,
+        model: agentConfig.modelKey,
+        tokensUsed: totalTokens,
+        duration: Date.now() - startTime,
+        checkpointResults,
+      };
+    }
+  }
+
+  // All checkpoints complete — concatenate summaries
+  const finalContent = checkpointResults
+    .filter((r) => r.summary)
+    .map((r) => `## ${r.summary}`)
+    .join('\n\n');
+
+  return {
+    content: finalContent || 'All checkpoints completed.',
+    model: agentConfig.modelKey,
+    tokensUsed: totalTokens,
+    duration: Date.now() - startTime,
+    checkpointResults,
   };
 }
 
@@ -981,24 +1294,46 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
           : undefined;
 
     try {
-      // Run the agent loop
-      const result = await runAgentLoop(
-        {
-          model: agentConfig.modelKey,
-          system_prompt: systemPrompt,
-          user_message: JSON.stringify({ missionId }),
-          tools,
-          max_tokens: agentConfig.maxTokens,
-          portkey: {
-            base_url: PORTKEY_BASE_URL,
-            api_key: PORTKEY_API_KEY,
-            virtual_key: agentConfig.modelKey,
-          },
-          tool_callback_url: `http://127.0.0.1:${actualPort}/tool-callback`,
-          cloud,
-        },
-        agentConfig.maxToolRounds,
+      // Check if checkpoints exist for this mission+stage
+      const checkpoints = await fetchCheckpoints(
+        d1ProxyUrl,
+        d1ProxyAuth,
+        missionId,
+        pipelineStage,
       );
+
+      let result: AgentRunResponse & { checkpointResults?: Array<{ index: number; status: string; summary?: string }> };
+
+      if (checkpoints.length > 0) {
+        // Use checkpoint-aware segmented execution
+        log(`Found ${checkpoints.length} checkpoints for ${missionId}/${pipelineStage}, using segmented execution`);
+        result = await runCheckpointAwareAgent(
+          req,
+          agentConfig,
+          toolCallback,
+          actualPort,
+          cloud,
+        );
+      } else {
+        // Standard agent loop (no checkpoints)
+        result = await runAgentLoop(
+          {
+            model: agentConfig.modelKey,
+            system_prompt: systemPrompt,
+            user_message: JSON.stringify({ missionId }),
+            tools,
+            max_tokens: agentConfig.maxTokens,
+            portkey: {
+              base_url: PORTKEY_BASE_URL,
+              api_key: PORTKEY_API_KEY,
+              virtual_key: agentConfig.modelKey,
+            },
+            tool_callback_url: `http://127.0.0.1:${actualPort}/tool-callback`,
+            cloud,
+          },
+          agentConfig.maxToolRounds,
+        );
+      }
 
       const duration = Date.now() - startTime;
 
@@ -1028,10 +1363,16 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
               model: result.model,
               llmPath,
               duration,
+              checkpoints: result.checkpointResults,
             },
           },
         ],
       };
+
+      // Include checkpoint data in payload if present
+      if (result.checkpointResults) {
+        resultPayload.checkpointData = result.checkpointResults;
+      }
 
       // If HitL agent, construct proposal
       if (agentConfig.oversight === 'hitl') {
