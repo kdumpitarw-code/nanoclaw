@@ -11,7 +11,14 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'http';
-import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, unlinkSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  unlinkSync,
+} from 'fs';
 import { join } from 'path';
 
 // Load .env file if present (launchd doesn't source it)
@@ -184,181 +191,129 @@ interface AsyncAgentRequest {
   fallbackModel?: string;
 }
 
-const AGENT_CONFIGS: Record<
+// --- Agent configs: canonical source is packages/agents/canonical-configs.json ---
+// NanoClaw reads the same JSON the hub uses, extending with NanoClaw-specific fields.
+
+interface NanoClawAgentConfig {
+  prompt: string;
+  modelKey: string;
+  tools: string[];
+  maxTokens: number;
+  oversight: string;
+  maxToolRounds: number;
+}
+
+// NanoClaw-specific extensions (fields and extra tools not in canonical configs)
+const NANOCLAW_EXTENSIONS: Record<
   string,
-  {
-    prompt: string;
-    modelKey: string;
-    tools: string[];
-    maxTokens: number;
-    oversight: string;
-    maxToolRounds: number;
-  }
+  { maxToolRounds: number; extraTools?: string[] }
 > = {
   pm: {
-    prompt: 'prompts/pm.md',
-    modelKey: 'local-reasoning',
-    tools: [
-      'mission-read',
-      'vault-read',
-      'spec-write',
-      'mission-write',
-      'd1-query',
-      'audit-query',
-      'bookmark-read',
-      'project-read',
-      'vault-list',
-      'doc-read',
-      'handoff-write',
-      'notify-user',
-      'schedule-create',
-      'template-create',
-      'project-write',
-      'git-log',
-      'kv-read',
-      'pdf-generate',
-      'docx-generate',
-      'slides-generate',
-      'spreadsheet-generate',
-      'chart-render',
-      'gantt-render',
-      'html-report',
-    ],
-    oversight: 'hitl',
-    maxTokens: 8192,
     maxToolRounds: 15,
+    extraTools: ['vault-read', 'mission-write', 'd1-query', 'audit-query'],
   },
   architect: {
-    prompt: 'prompts/architect.md',
-    modelKey: 'local-reasoning',
-    tools: [
-      'mission-read',
+    maxToolRounds: 15,
+    extraTools: [
       'vault-read',
-      'arch-write',
       'mission-write',
       'd1-query',
       'audit-query',
-      'file-read',
-      'file-list',
-      'grep-search',
-      'doc-read',
-      'agents-md-read',
       'git-log',
       'git-diff',
-      'notify-user',
-      'handoff-write',
       'vault-list',
       'bookmark-read',
       'project-read',
-      'diagram-render',
     ],
-    oversight: 'hitl',
-    maxTokens: 8192,
-    maxToolRounds: 15,
   },
   developer: {
-    prompt: 'prompts/developer.md',
-    modelKey: 'local-coding',
-    tools: [
-      'mission-read',
+    maxToolRounds: 20,
+    extraTools: [
       'vault-read',
-      'code-write',
-      'build-check',
       'test-run',
-      'lint-check',
-      'type-check',
-      'migration-write',
       'migration-check',
-      'file-read',
-      'file-list',
-      'grep-search',
       'git-log',
       'git-diff',
-      'git-branch-list',
       'd1-query',
-      'doc-read',
-      'agents-md-read',
-      'notify-user',
-      'handoff-write',
       'mission-write',
       'artifact-write',
     ],
-    oversight: 'hitl',
-    maxTokens: 8192,
-    maxToolRounds: 20,
   },
   qa: {
-    prompt: 'prompts/qa.md',
-    modelKey: 'local-reasoning',
-    tools: [
-      'mission-read',
-      'vault-read',
-      'file-read',
-      'file-list',
-      'grep-search',
-      'git-log',
-      'git-diff',
-      'd1-query',
-      'api-test',
-      'screenshot-capture',
-      'bundle-size',
-      'service-health',
-      'create-defect',
-      'notify-user',
-      'mission-write',
-      'handoff-write',
-    ],
-    oversight: 'hitl',
-    maxTokens: 8192,
     maxToolRounds: 15,
+    extraTools: [
+      'vault-read',
+      'file-list',
+      'd1-query',
+      'mission-write',
+    ],
   },
   devops: {
-    prompt: 'prompts/devops.md',
-    modelKey: 'local-background',
-    tools: [
-      'deploy-staging',
-      'deploy-production',
-      'rollback-deploy',
-      'service-health',
-      'logs-read',
-      'system-info',
-      'mission-read',
-      'd1-query',
-      'notify-user',
-      'mission-write',
-      'git-log',
-      'git-diff',
-    ],
-    oversight: 'hitl',
-    maxTokens: 4096,
     maxToolRounds: 10,
+    extraTools: ['mission-read', 'd1-query', 'mission-write', 'git-log', 'git-diff'],
   },
   'tech-writer': {
-    prompt: 'prompts/tech-writer.md',
-    modelKey: 'local-reasoning',
-    tools: [
-      'mission-read',
+    maxToolRounds: 15,
+    extraTools: [
       'vault-read',
       'vault-write-agent',
-      'file-read',
       'file-list',
-      'grep-search',
-      'doc-read',
-      'agents-md-read',
-      'prompt-read',
-      'artifact-write',
       'mission-write',
-      'notify-user',
-      'git-log',
-      'handoff-write',
       'vault-list',
       'd1-query',
     ],
-    oversight: 'hitl',
-    maxTokens: 8192,
-    maxToolRounds: 15,
   },
 };
+
+// Load canonical configs from the shared JSON and merge with NanoClaw extensions
+function loadCanonicalConfigs(): Record<string, NanoClawAgentConfig> {
+  try {
+    const raw = readFileSync(
+      join(AGENTS_BASE, 'canonical-configs.json'),
+      'utf-8',
+    );
+    const canonical = JSON.parse(raw) as Record<
+      string,
+      {
+        prompt: string;
+        modelKey: string;
+        tools: string[];
+        maxTokens: number;
+        oversight: string;
+      }
+    >;
+
+    // Only include builder agents that NanoClaw runs
+    const builderAgents = ['pm', 'architect', 'developer', 'qa', 'devops', 'tech-writer'];
+    const configs: Record<string, NanoClawAgentConfig> = {};
+
+    for (const name of builderAgents) {
+      const base = canonical[name];
+      if (!base) {
+        log(`Warning: agent "${name}" not found in canonical configs`);
+        continue;
+      }
+      const ext = NANOCLAW_EXTENSIONS[name] || { maxToolRounds: 10 };
+      configs[name] = {
+        prompt: base.prompt,
+        modelKey: base.modelKey,
+        // Merge canonical tools with NanoClaw-specific tools (deduplicated)
+        tools: [...new Set([...base.tools, ...(ext.extraTools || [])])],
+        maxTokens: base.maxTokens,
+        oversight: base.oversight,
+        maxToolRounds: ext.maxToolRounds,
+      };
+    }
+
+    log(`Loaded canonical configs for ${Object.keys(configs).length} agents`);
+    return configs;
+  } catch (err) {
+    log(`Error loading canonical configs: ${err}. Falling back to empty.`);
+    return {};
+  }
+}
+
+const AGENT_CONFIGS = loadCanonicalConfigs();
 
 const PROPOSAL_TYPES: Record<string, string> = {
   pm: 'builder-spec',
@@ -429,7 +384,7 @@ async function callOpenRouter(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
+      Authorization: `Bearer ${apiKey}`,
       'HTTP-Referer': 'https://alacrityhub.ca',
       'X-Title': 'Alacrity Hub Pipeline',
     },
@@ -460,8 +415,16 @@ async function callLLM(
 ): Promise<ChatCompletionResponse> {
   // Force cloud path — skip Portkey entirely
   if (cloud?.forceCloud) {
-    log(`callLLM: force_cloud=true, using OpenRouter model=${cloud.fallbackModel}`);
-    return callOpenRouter(cloud.apiKey, cloud.fallbackModel, messages, tools, maxTokens);
+    log(
+      `callLLM: force_cloud=true, using OpenRouter model=${cloud.fallbackModel}`,
+    );
+    return callOpenRouter(
+      cloud.apiKey,
+      cloud.fallbackModel,
+      messages,
+      tools,
+      maxTokens,
+    );
   }
 
   // Try Portkey (local Ollama)
@@ -512,8 +475,16 @@ async function callLLM(
   } catch (portkeyErr) {
     // If cloud fallback is available, try OpenRouter
     if (cloud) {
-      log(`callLLM: Portkey failed (${portkeyErr}), falling back to OpenRouter model=${cloud.fallbackModel}`);
-      return callOpenRouter(cloud.apiKey, cloud.fallbackModel, messages, tools, maxTokens);
+      log(
+        `callLLM: Portkey failed (${portkeyErr}), falling back to OpenRouter model=${cloud.fallbackModel}`,
+      );
+      return callOpenRouter(
+        cloud.apiKey,
+        cloud.fallbackModel,
+        messages,
+        tools,
+        maxTokens,
+      );
     }
     // No fallback — rethrow
     throw portkeyErr;
@@ -646,12 +617,20 @@ async function runAgentLoop(
 let _repoStructure: string | null = null;
 function getRepoStructure(): string {
   if (_repoStructure) return _repoStructure;
-  const repoRoot = join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub');
+  const repoRoot = join(
+    process.env.HOME || '/root',
+    'Vibe Sphere',
+    'alacrity_hub',
+  );
   try {
     const { readdirSync } = require('fs');
     const topDirs = readdirSync(repoRoot, { withFileTypes: true })
-      .filter((d: { isDirectory: () => boolean; name: string }) =>
-        d.isDirectory() && !d.name.startsWith('.') && d.name !== 'node_modules')
+      .filter(
+        (d: { isDirectory: () => boolean; name: string }) =>
+          d.isDirectory() &&
+          !d.name.startsWith('.') &&
+          d.name !== 'node_modules',
+      )
       .map((d: { name: string }) => d.name);
 
     const structure: string[] = [];
@@ -659,8 +638,12 @@ function getRepoStructure(): string {
       const subPath = join(repoRoot, dir);
       try {
         const subs = readdirSync(subPath, { withFileTypes: true })
-          .filter((d: { isDirectory: () => boolean; name: string }) =>
-            d.isDirectory() && !d.name.startsWith('.') && d.name !== 'node_modules')
+          .filter(
+            (d: { isDirectory: () => boolean; name: string }) =>
+              d.isDirectory() &&
+              !d.name.startsWith('.') &&
+              d.name !== 'node_modules',
+          )
           .map((d: { name: string }) => d.name);
         if (subs.length > 0) {
           structure.push(`${dir}/: ${subs.join(', ')}`);
@@ -679,8 +662,16 @@ function getRepoStructure(): string {
 }
 
 function loadAgentPrompt(promptPath: string): string {
+  let preamble = '';
+  try {
+    preamble =
+      readFileSync(join(AGENTS_BASE, 'prompts', '_preamble.md'), 'utf-8') +
+      '\n\n';
+  } catch {
+    // Preamble missing — continue without it
+  }
   const prompt = readFileSync(join(AGENTS_BASE, promptPath), 'utf-8');
-  return prompt + getRepoStructure();
+  return preamble + prompt + getRepoStructure();
 }
 
 function loadToolDefs(toolNames: string[]): ToolDefinition[] {
@@ -720,7 +711,9 @@ async function postResults(
         signal: AbortSignal.timeout(30_000),
       });
       if (res.ok) return;
-      log(`Results POST to ${url} failed (${res.status}), attempt ${attempt + 1}`);
+      log(
+        `Results POST to ${url} failed (${res.status}), attempt ${attempt + 1}`,
+      );
     } catch (err) {
       log(`Results POST to ${url} error, attempt ${attempt + 1}: ${err}`);
     }
@@ -734,7 +727,10 @@ async function postResults(
   const filename = `${Date.now()}-${(p.missionId as string) || 'unknown'}.json`;
   // Store the resultsUrl and auth alongside the payload for replay
   const fallbackData = { _resultsUrl: url, _resultsAuth: authToken, ...p };
-  writeFileSync(join(FALLBACK_DIR, filename), JSON.stringify(fallbackData, null, 2));
+  writeFileSync(
+    join(FALLBACK_DIR, filename),
+    JSON.stringify(fallbackData, null, 2),
+  );
   log(`All result POST retries failed. Written to fallback: ${filename}`);
 }
 
@@ -892,11 +888,20 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
     const actualPort = (callbackServer.address() as { port: number }).port;
 
     // Construct cloud config for OpenRouter fallback
-    const cloud = req.forceCloud && req.fallbackModel && OPENROUTER_API_KEY
-      ? { forceCloud: true, fallbackModel: req.fallbackModel, apiKey: OPENROUTER_API_KEY }
-      : OPENROUTER_API_KEY && req.fallbackModel
-        ? { forceCloud: false, fallbackModel: req.fallbackModel, apiKey: OPENROUTER_API_KEY }
-        : undefined;
+    const cloud =
+      req.forceCloud && req.fallbackModel && OPENROUTER_API_KEY
+        ? {
+            forceCloud: true,
+            fallbackModel: req.fallbackModel,
+            apiKey: OPENROUTER_API_KEY,
+          }
+        : OPENROUTER_API_KEY && req.fallbackModel
+          ? {
+              forceCloud: false,
+              fallbackModel: req.fallbackModel,
+              apiKey: OPENROUTER_API_KEY,
+            }
+          : undefined;
 
     try {
       // Run the agent loop
@@ -1356,10 +1361,14 @@ const server = createServer(async (req, res) => {
       // Spawn background execution with concurrency limit
       setImmediate(async () => {
         if (agentSemaphore.active >= MAX_CONCURRENT_AGENTS) {
-          log(`Agent ${agent}/${missionId} queued (${agentSemaphore.active} active, ${agentSemaphore.queued + 1} will wait)`);
+          log(
+            `Agent ${agent}/${missionId} queued (${agentSemaphore.active} active, ${agentSemaphore.queued + 1} will wait)`,
+          );
         }
         await agentSemaphore.acquire();
-        log(`Agent ${agent}/${missionId} acquired slot (${agentSemaphore.active} active, ${agentSemaphore.queued} waiting)`);
+        log(
+          `Agent ${agent}/${missionId} acquired slot (${agentSemaphore.active} active, ${agentSemaphore.queued} waiting)`,
+        );
         try {
           await runAsyncAgent({
             agent,
@@ -1375,7 +1384,9 @@ const server = createServer(async (req, res) => {
         } catch (err) {
           log(`Async agent error for ${agent}/${missionId}: ${err}`);
         } finally {
-          log(`Agent ${agent}/${missionId} releasing slot (was ${agentSemaphore.active} active, ${agentSemaphore.queued} waiting)`);
+          log(
+            `Agent ${agent}/${missionId} releasing slot (was ${agentSemaphore.active} active, ${agentSemaphore.queued} waiting)`,
+          );
           agentSemaphore.release();
         }
       });
@@ -1507,7 +1518,9 @@ async function replayFallbackFiles(): Promise<void> {
         unlinkSync(filePath);
         log(`Fallback ${file}: replayed successfully, deleted`);
       } else {
-        log(`Fallback ${file}: replay failed (${res.status}), will retry next startup`);
+        log(
+          `Fallback ${file}: replay failed (${res.status}), will retry next startup`,
+        );
       }
     } catch (err) {
       log(`Fallback ${file}: replay error: ${err}`);
@@ -1525,7 +1538,11 @@ server.listen(PORT, HOST, () => {
   log(`Intake: POST /api/mission-intake`);
 
   // Replay any pending fallback files after a short delay
-  setTimeout(() => replayFallbackFiles().catch((e) => log(`Fallback replay error: ${e}`)), 5000);
+  setTimeout(
+    () =>
+      replayFallbackFiles().catch((e) => log(`Fallback replay error: ${e}`)),
+    5000,
+  );
 });
 
 process.on('SIGTERM', () => {
