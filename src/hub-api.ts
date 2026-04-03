@@ -527,6 +527,55 @@ async function executeToolCallback(
   return (await res.json()) as { result: string };
 }
 
+// Intercepted tools — handled locally in hub-api, not sent to callback server
+const INTERCEPTED_TOOLS = new Set(['checkpoint_complete', 'preflight_rerun']);
+
+/**
+ * Handle intercepted tools locally without calling the callback server.
+ */
+async function handleInterceptedTool(
+  toolName: string,
+  params: Record<string, unknown>,
+  req?: { pipelineStage?: string; missionId?: string },
+): Promise<string> {
+  if (toolName === 'checkpoint_complete') {
+    // Truncate summary to ~200 tokens (roughly 800 chars)
+    let summary = String(params.summary ?? '');
+    if (summary.length > 800) {
+      const truncated = summary.slice(0, 800);
+      const lastSentence = truncated.lastIndexOf('.');
+      summary = lastSentence > 400 ? truncated.slice(0, lastSentence + 1) : truncated;
+    }
+    return JSON.stringify({
+      result: 'Checkpoint marked complete.',
+      summary_stored: true,
+      truncated: summary.length < String(params.summary ?? '').length,
+    });
+  }
+
+  if (toolName === 'preflight_rerun') {
+    // Re-run preflight script
+    const scriptPath = join(
+      process.env.HUB_ROOT ?? join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub'),
+      'scripts',
+      'preflight.sh',
+    );
+    try {
+      const stage = req?.pipelineStage ?? 'unknown';
+      const missionId = req?.missionId ?? 'unknown';
+      const { stdout } = await execAsync(
+        `bash "${scriptPath}" "${stage}" "${missionId}"`,
+        { timeout: 30000 },
+      );
+      return stdout.trim();
+    } catch (err: any) {
+      return JSON.stringify({ status: 'fail', error: err.message });
+    }
+  }
+
+  return JSON.stringify({ error: `Unknown intercepted tool: ${toolName}` });
+}
+
 /**
  * Run the agent loop: call LLM, execute tool calls, repeat until done.
  */
@@ -599,11 +648,19 @@ async function runAgentLoop(
 
       log(`Tool call: ${toolName}(${JSON.stringify(params).slice(0, 200)})`);
 
-      const result = await executeToolCallback(
-        req.tool_callback_url,
-        toolName,
-        params,
-      );
+      let result: { result: string };
+
+      // Intercepted tools — handle locally, don't send to callback server
+      if (INTERCEPTED_TOOLS.has(toolName)) {
+        const interceptResult = await handleInterceptedTool(toolName, params);
+        result = { result: interceptResult };
+      } else {
+        result = await executeToolCallback(
+          req.tool_callback_url,
+          toolName,
+          params,
+        );
+      }
 
       messages.push({
         role: 'tool',
@@ -1519,12 +1576,15 @@ const server = createServer(async (req, res) => {
       };
 
       if (!request.stage || !request.missionId) {
-        jsonResponse(res, 400, { error: 'Missing required fields: stage, missionId' });
+        jsonResponse(res, 400, {
+          error: 'Missing required fields: stage, missionId',
+        });
         return;
       }
 
       const scriptPath = join(
-        process.env.HUB_ROOT ?? join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub'),
+        process.env.HUB_ROOT ??
+          join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub'),
         'scripts',
         'preflight.sh',
       );
@@ -1538,7 +1598,7 @@ const server = createServer(async (req, res) => {
         request.forceCloud ? 'true' : 'false',
       ];
 
-      const cmd = `bash "${scriptPath}" ${args.map(a => `"${a}"`).join(' ')}`;
+      const cmd = `bash "${scriptPath}" ${args.map((a) => `"${a}"`).join(' ')}`;
       log(`Running preflight: ${cmd.slice(0, 200)}...`);
 
       try {
