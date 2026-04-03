@@ -189,6 +189,8 @@ interface AsyncAgentRequest {
   d1ProxyAuth: string;
   forceCloud?: boolean;
   fallbackModel?: string;
+  /** User's preferred response language (e.g. "French"). When set and not "English", injected into system prompt. */
+  language?: string;
 }
 
 // --- Agent configs: canonical source is packages/agents/canonical-configs.json ---
@@ -241,16 +243,17 @@ const NANOCLAW_EXTENSIONS: Record<
   },
   qa: {
     maxToolRounds: 15,
-    extraTools: [
-      'vault-read',
-      'file-list',
-      'd1-query',
-      'mission-write',
-    ],
+    extraTools: ['vault-read', 'file-list', 'd1-query', 'mission-write'],
   },
   devops: {
     maxToolRounds: 10,
-    extraTools: ['mission-read', 'd1-query', 'mission-write', 'git-log', 'git-diff'],
+    extraTools: [
+      'mission-read',
+      'd1-query',
+      'mission-write',
+      'git-log',
+      'git-diff',
+    ],
   },
   'tech-writer': {
     maxToolRounds: 15,
@@ -284,7 +287,14 @@ function loadCanonicalConfigs(): Record<string, NanoClawAgentConfig> {
     >;
 
     // Only include builder agents that NanoClaw runs
-    const builderAgents = ['pm', 'architect', 'developer', 'qa', 'devops', 'tech-writer'];
+    const builderAgents = [
+      'pm',
+      'architect',
+      'developer',
+      'qa',
+      'devops',
+      'tech-writer',
+    ];
     const configs: Record<string, NanoClawAgentConfig> = {};
 
     for (const name of builderAgents) {
@@ -770,7 +780,12 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
 
   try {
     // Load prompt and tool definitions from filesystem
-    const systemPrompt = loadAgentPrompt(agentConfig.prompt);
+    // Select stage-specific prompt if available (e.g. briefing vs pm_spec)
+    const promptPath = agentConfig.promptByStage?.[pipelineStage] ?? agentConfig.prompt;
+    let systemPrompt = loadAgentPrompt(promptPath);
+    if (req.language && req.language !== 'English') {
+      systemPrompt += `\n\nAlways respond in ${req.language}. Do not switch languages unless the user explicitly asks.`;
+    }
     const tools = loadToolDefs(agentConfig.tools);
 
     // Import tool handlers dynamically from the agents package
@@ -1333,6 +1348,7 @@ const server = createServer(async (req, res) => {
         d1ProxyAuth,
         forceCloud,
         fallbackModel,
+        language,
       } = body;
 
       if (
@@ -1380,6 +1396,7 @@ const server = createServer(async (req, res) => {
             d1ProxyAuth: d1ProxyAuth || '',
             forceCloud: forceCloud || false,
             fallbackModel: fallbackModel || '',
+            language: language || undefined,
           });
         } catch (err) {
           log(`Async agent error for ${agent}/${missionId}: ${err}`);
