@@ -19,7 +19,11 @@ import {
   readdirSync,
   unlinkSync,
 } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 // Load .env file if present (launchd doesn't source it)
 // Resolve from compiled dist/ back to repo root
@@ -781,7 +785,8 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
   try {
     // Load prompt and tool definitions from filesystem
     // Select stage-specific prompt if available (e.g. briefing vs pm_spec)
-    const promptPath = agentConfig.promptByStage?.[pipelineStage] ?? agentConfig.prompt;
+    const promptPath =
+      agentConfig.promptByStage?.[pipelineStage] ?? agentConfig.prompt;
     let systemPrompt = loadAgentPrompt(promptPath);
     if (req.language && req.language !== 'English') {
       systemPrompt += `\n\nAlways respond in ${req.language}. Do not switch languages unless the user explicitly asks.`;
@@ -1495,6 +1500,64 @@ const server = createServer(async (req, res) => {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       log(`Mission intake error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // POST /api/preflight — run preflight environment checks
+  if (url.pathname === '/api/preflight' && method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const request = JSON.parse(body) as {
+        stage: string;
+        missionId: string;
+        worktreePath?: string;
+        d1ProxyUrl?: string;
+        d1ProxyAuth?: string;
+        forceCloud?: boolean;
+      };
+
+      if (!request.stage || !request.missionId) {
+        jsonResponse(res, 400, { error: 'Missing required fields: stage, missionId' });
+        return;
+      }
+
+      const scriptPath = join(
+        process.env.HUB_ROOT ?? join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub'),
+        'scripts',
+        'preflight.sh',
+      );
+
+      const args = [
+        request.stage,
+        request.missionId,
+        request.worktreePath ?? '',
+        request.d1ProxyUrl ?? '',
+        request.d1ProxyAuth ?? '',
+        request.forceCloud ? 'true' : 'false',
+      ];
+
+      const cmd = `bash "${scriptPath}" ${args.map(a => `"${a}"`).join(' ')}`;
+      log(`Running preflight: ${cmd.slice(0, 200)}...`);
+
+      try {
+        const { stdout } = await execAsync(cmd, { timeout: 35000 });
+        const result = JSON.parse(stdout.trim());
+        jsonResponse(res, 200, result);
+      } catch (execErr: any) {
+        // Script execution failed — return structured error
+        jsonResponse(res, 200, {
+          status: 'fail',
+          stage: request.stage,
+          checks: [],
+          error: execErr.message ?? 'preflight script failed',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`Preflight error: ${message}`);
       jsonResponse(res, 500, { error: message });
     }
     return;
