@@ -47,6 +47,11 @@ import {
   type ShipAuditState,
   type GitState,
 } from '@alacrity/tools/validation';
+import {
+  parseLifecycle,
+  inferPhase,
+  type ArtifactState,
+} from '@alacrity/tools/lifecycle-parser';
 
 const execAsync = promisify(exec);
 
@@ -2282,6 +2287,57 @@ const server = createServer(async (req, res) => {
   }
 
   // =========================================================================
+  // Phase Serving — hub returns current lifecycle phase based on artifact state
+  // =========================================================================
+
+  // POST /api/workflow/phase — return lifecycle phase instructions
+  if (url.pathname === '/api/workflow/phase' && method === 'POST') {
+    try {
+      // Check for ?phase= query param (bypass inference, return specific phase)
+      const requestedPhase = url.searchParams.get('phase');
+
+      // Parse lifecycle.md on every request (no cache — file is small, edits take effect immediately)
+      const lifecyclePath = resolve(
+        import.meta.dirname ?? __dirname,
+        '..',
+        '..',
+        'alacrity_hub',
+        'packages',
+        'agents',
+        'lifecycle.md',
+      );
+      const phases = parseLifecycle(lifecyclePath);
+
+      if (requestedPhase) {
+        const found = phases.find((p) => p.phase === requestedPhase);
+        if (!found) {
+          jsonResponse(res, 400, {
+            error: `Unknown phase: ${requestedPhase}. Valid: ${phases.map((p) => p.phase).join(', ')}`,
+          });
+          return;
+        }
+        log(`workflow/phase: returning requested phase "${requestedPhase}"`);
+        jsonResponse(res, 200, found);
+        return;
+      }
+
+      // Infer phase from artifact state
+      const body = await readBody(req);
+      const request = JSON.parse(body) as { artifacts?: ArtifactState };
+      const artifacts = request.artifacts ?? {};
+      const result = inferPhase(artifacts, phases);
+
+      log(`workflow/phase: inferred phase "${result.phase}"`);
+      jsonResponse(res, 200, result);
+      return;
+    } catch (err: any) {
+      log(`workflow/phase error: ${err.message}`);
+      jsonResponse(res, 500, { error: err.message });
+      return;
+    }
+  }
+
+  // =========================================================================
   // Gate Validation — uniform enforcement for all agent contexts
   // =========================================================================
 
@@ -2310,7 +2366,8 @@ const server = createServer(async (req, res) => {
         }
 
         // Try to extract assessment block from larger content
-        const block = extractAssessmentBlock(request.content) ?? request.content;
+        const block =
+          extractAssessmentBlock(request.content) ?? request.content;
         const result = validateAssessmentBlock(block);
 
         log(
@@ -2326,7 +2383,8 @@ const server = createServer(async (req, res) => {
       if (request.gate === 'pre-edit') {
         if (!request.content) {
           jsonResponse(res, 400, {
-            error: 'Missing required field: content (pre-edit confirmation text)',
+            error:
+              'Missing required field: content (pre-edit confirmation text)',
           });
           return;
         }
@@ -2439,6 +2497,7 @@ server.listen(PORT, HOST, () => {
   log(`Vault-query:  POST /api/tools/vault-query`);
   log(`Vault-stats:  GET  /api/tools/vault-stats`);
   log(`Vault-refresh:POST /api/tools/vault-refresh`);
+  log(`Phase:        POST /api/workflow/phase`);
   log(`Validate:     POST /api/workflow/validate`);
 
   // Replay any pending fallback files after a short delay
