@@ -146,13 +146,52 @@ let sessionD1: { prepare: (sql: string) => unknown } | null = null;
 async function getSessionD1() {
   if (sessionD1) return sessionD1;
   if (!HUB_D1_PROXY_URL || !AGENT_RESULTS_SECRET) {
-    throw new Error('HUB_D1_PROXY_URL and AGENT_RESULTS_SECRET required for session routes');
+    throw new Error(
+      'HUB_D1_PROXY_URL and AGENT_RESULTS_SECRET required for session routes',
+    );
   }
   const { createD1ProxyAdapter } = await import(
     join(agentsPkgSrc, 'd1-proxy-adapter.ts')
   );
-  sessionD1 = createD1ProxyAdapter(HUB_D1_PROXY_URL, AGENT_RESULTS_SECRET) as typeof sessionD1;
+  sessionD1 = createD1ProxyAdapter(
+    HUB_D1_PROXY_URL,
+    AGENT_RESULTS_SECRET,
+  ) as typeof sessionD1;
   return sessionD1!;
+}
+
+// Vault paths
+const AGENT_VAULT_BASE = join(
+  process.env.HOME || '/root',
+  'Vaults',
+  'AlacrityHub',
+  'agent',
+);
+const QUARANTINE_DIR = join(AGENT_VAULT_BASE, 'quarantine');
+const HUMAN_VAULT_PATH = process.env.HUMAN_VAULT_PATH || join(
+  process.env.HOME || '/root',
+  'Vaults',
+  'HumanVault',
+);
+
+function writeVaultFile(
+  folder: string,
+  filename: string,
+  frontmatter: Record<string, string>,
+  body: string,
+): void {
+  const dir = join(AGENT_VAULT_BASE, folder);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const filePath = join(dir, filename);
+
+  const fm = Object.entries(frontmatter)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join('\n');
+  const content = `---\n${fm}\n---\n\n${body}\n`;
+
+  writeFileSync(filePath, content, 'utf-8');
+  invalidateVaultCache();
+  log(`vault-write: ${folder}/${filename}`);
 }
 
 /**
@@ -2303,13 +2342,147 @@ const server = createServer(async (req, res) => {
   }
 
   // =========================================================================
+  // Vault Promote / Quarantine — filesystem ops for vault promotion flow
+  // =========================================================================
+
+  // POST /api/vault/promote — quarantine or confirm a note for vault promotion
+  if (url.pathname === '/api/vault/promote' && method === 'POST') {
+    if (AGENT_RESULTS_SECRET) {
+      const auth = req.headers['authorization'];
+      if (!auth || auth !== `Bearer ${AGENT_RESULTS_SECRET}`) {
+        jsonResponse(res, 403, { error: 'Invalid authorization' });
+        return;
+      }
+    }
+    try {
+      const action = url.searchParams.get('action');
+      const body = JSON.parse(await readBody(req));
+
+      if (action === 'quarantine') {
+        const { noteId, title, refinedContent, suggestedTags } = body as {
+          noteId: string; title: string; refinedContent: string; suggestedTags?: string[];
+        };
+        if (!noteId || !title || !refinedContent) {
+          jsonResponse(res, 400, { error: 'noteId, title, and refinedContent required' });
+          return;
+        }
+
+        if (!existsSync(QUARANTINE_DIR)) mkdirSync(QUARANTINE_DIR, { recursive: true });
+
+        const safeTitle = title.replace(/[^a-zA-Z0-9_\- ]/g, '').trim().replace(/\s+/g, '-');
+        const filename = `${safeTitle}-${noteId.slice(0, 8)}.md`;
+        const filePath = join(QUARANTINE_DIR, filename);
+
+        const tags = (suggestedTags ?? []).join(', ');
+        const created = new Date().toISOString();
+        const fm = `---\nagent: promoter\nmission: ${noteId}\ntags: [${tags}]\ncreated: ${created}\nstatus: quarantined\n---\n`;
+        writeFileSync(filePath, fm + '\n' + refinedContent, 'utf-8');
+
+        log(`vault-promote: quarantined ${filename}`);
+        jsonResponse(res, 201, { quarantinePath: filePath, filename });
+      } else if (action === 'confirm') {
+        const { quarantinePath, targetFolder } = body as {
+          noteId: string; quarantinePath: string; targetFolder: string;
+        };
+        if (!quarantinePath || !targetFolder) {
+          jsonResponse(res, 400, { error: 'quarantinePath and targetFolder required' });
+          return;
+        }
+
+        if (!existsSync(quarantinePath)) {
+          jsonResponse(res, 404, { error: `Quarantine file not found: ${quarantinePath}` });
+          return;
+        }
+
+        const content = readFileSync(quarantinePath, 'utf-8');
+        const filename = quarantinePath.split('/').pop() ?? 'note.md';
+
+        const destDir = join(HUMAN_VAULT_PATH, targetFolder);
+        if (!existsSync(destDir)) mkdirSync(destDir, { recursive: true });
+
+        const destPath = join(destDir, filename);
+        writeFileSync(destPath, content, 'utf-8');
+        unlinkSync(quarantinePath);
+        invalidateVaultCache();
+
+        log(`vault-promote: confirmed → ${targetFolder}/${filename}`);
+        jsonResponse(res, 200, { humanVaultPath: destPath });
+      } else {
+        jsonResponse(res, 400, { error: `Unknown action: ${action}` });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`vault-promote error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // GET /api/vault/quarantine — list quarantined notes
+  if (url.pathname === '/api/vault/quarantine' && method === 'GET') {
+    if (AGENT_RESULTS_SECRET) {
+      const auth = req.headers['authorization'];
+      if (!auth || auth !== `Bearer ${AGENT_RESULTS_SECRET}`) {
+        jsonResponse(res, 403, { error: 'Invalid authorization' });
+        return;
+      }
+    }
+    try {
+      if (!existsSync(QUARANTINE_DIR)) {
+        jsonResponse(res, 200, []);
+        return;
+      }
+      const files = readdirSync(QUARANTINE_DIR)
+        .filter((f: string) => f.endsWith('.md'))
+        .map((f: string) => ({ filename: f, path: join(QUARANTINE_DIR, f) }));
+      log(`vault-quarantine: listed ${files.length} files`);
+      jsonResponse(res, 200, files);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`vault-quarantine list error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // DELETE /api/vault/quarantine — reject a quarantined note
+  if (url.pathname === '/api/vault/quarantine' && method === 'DELETE') {
+    if (AGENT_RESULTS_SECRET) {
+      const auth = req.headers['authorization'];
+      if (!auth || auth !== `Bearer ${AGENT_RESULTS_SECRET}`) {
+        jsonResponse(res, 403, { error: 'Invalid authorization' });
+        return;
+      }
+    }
+    try {
+      const path = url.searchParams.get('path');
+      if (!path) {
+        jsonResponse(res, 400, { error: 'path query param required' });
+        return;
+      }
+      if (!existsSync(path)) {
+        jsonResponse(res, 404, { error: `Quarantine file not found: ${path}` });
+        return;
+      }
+      unlinkSync(path);
+      log(`vault-quarantine: rejected ${path.split('/').pop()}`);
+      jsonResponse(res, 200, { deleted: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`vault-quarantine delete error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // =========================================================================
   // Session Registration — agents register work sessions, get bundled context
   // =========================================================================
 
   // POST /api/sessions/register — agent registers work session, gets bundled context
   if (url.pathname === '/api/sessions/register' && method === 'POST') {
     try {
-      const d1 = await getSessionD1() as any;
+      const d1 = (await getSessionD1()) as any;
       const body = await readBody(req);
       const request = JSON.parse(body) as {
         agent: string;
@@ -2321,12 +2494,18 @@ const server = createServer(async (req, res) => {
         return;
       }
       if (!request.area?.files?.length && !request.area?.topic) {
-        jsonResponse(res, 400, { error: 'At least one of area.files or area.topic required' });
+        jsonResponse(res, 400, {
+          error: 'At least one of area.files or area.topic required',
+        });
         return;
       }
 
       // Clean up stale sessions
-      await d1.prepare("UPDATE agent_sessions SET closed_at = datetime('now'), phase_at_close = 'stale' WHERE closed_at IS NULL AND started_at < datetime('now', '-4 hours')").run();
+      await d1
+        .prepare(
+          "UPDATE agent_sessions SET closed_at = datetime('now'), phase_at_close = 'stale' WHERE closed_at IS NULL AND started_at < datetime('now', '-4 hours')",
+        )
+        .run();
 
       // Generate session ID
       const now = new Date();
@@ -2334,9 +2513,14 @@ const server = createServer(async (req, res) => {
       const sessionId = `s_${ts}_${request.agent}`;
 
       // Register session
-      const areaFiles = request.area?.files ? JSON.stringify(request.area.files) : null;
+      const areaFiles = request.area?.files
+        ? JSON.stringify(request.area.files)
+        : null;
       const areaTopic = request.area?.topic ?? null;
-      await d1.prepare("INSERT INTO agent_sessions (id, agent, area_files, area_topic) VALUES (?, ?, ?, ?)")
+      await d1
+        .prepare(
+          'INSERT INTO agent_sessions (id, agent, area_files, area_topic) VALUES (?, ?, ?, ?)',
+        )
         .bind(sessionId, request.agent, areaFiles, areaTopic)
         .run();
 
@@ -2348,25 +2532,37 @@ const server = createServer(async (req, res) => {
       });
 
       // 2. Active sessions (exclude self)
-      const activeSessions = await d1.prepare(
-        "SELECT id, agent, area_topic, started_at FROM agent_sessions WHERE closed_at IS NULL"
-      ).all();
-      const otherSessions = activeSessions.results.filter((s: any) => s.id !== sessionId);
+      const activeSessions = await d1
+        .prepare(
+          'SELECT id, agent, area_topic, started_at FROM agent_sessions WHERE closed_at IS NULL',
+        )
+        .all();
+      const otherSessions = activeSessions.results.filter(
+        (s: any) => s.id !== sessionId,
+      );
 
       // 3. D1 context (errors, missions, activity) — individual queries via d1.query fallback
-      const errors = await d1.prepare(
-        "SELECT id, source, message, severity, timestamp FROM error_logs WHERE resolved = FALSE ORDER BY timestamp DESC LIMIT 10"
-      ).all();
+      const errors = await d1
+        .prepare(
+          'SELECT id, source, message, severity, timestamp FROM error_logs WHERE resolved = FALSE ORDER BY timestamp DESC LIMIT 10',
+        )
+        .all();
 
-      const missions = await d1.prepare(
-        "SELECT id, title, status, completed_at FROM missions WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 5"
-      ).all();
+      const missions = await d1
+        .prepare(
+          "SELECT id, title, status, completed_at FROM missions WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 5",
+        )
+        .all();
 
-      const activity = await d1.prepare(
-        "SELECT route, model, timestamp, tokens_in, tokens_out FROM request_logs ORDER BY timestamp DESC LIMIT 10"
-      ).all();
+      const activity = await d1
+        .prepare(
+          'SELECT route, model, timestamp, tokens_in, tokens_out FROM request_logs ORDER BY timestamp DESC LIMIT 10',
+        )
+        .all();
 
-      log(`sessions/register: ${request.agent} registered session ${sessionId} (topic: ${areaTopic})`);
+      log(
+        `sessions/register: ${request.agent} registered session ${sessionId} (topic: ${areaTopic})`,
+      );
 
       jsonResponse(res, 200, {
         sessionId,
@@ -2393,24 +2589,193 @@ const server = createServer(async (req, res) => {
   // POST /api/sessions/close — agent closes work session
   if (url.pathname === '/api/sessions/close' && method === 'POST') {
     try {
-      const d1 = await getSessionD1() as any;
+      const d1 = (await getSessionD1()) as any;
       const body = await readBody(req);
-      const request = JSON.parse(body) as { sessionId: string; phaseAtClose?: string };
+      const request = JSON.parse(body) as {
+        sessionId: string;
+        phaseAtClose?: string;
+        feedback?: string;
+        failureContext?: string;
+      };
 
       if (!request.sessionId) {
         jsonResponse(res, 400, { error: 'Missing required field: sessionId' });
         return;
       }
 
-      await d1.prepare("UPDATE agent_sessions SET closed_at = datetime('now'), phase_at_close = ? WHERE id = ?")
+      await d1
+        .prepare(
+          "UPDATE agent_sessions SET closed_at = datetime('now'), phase_at_close = ? WHERE id = ?",
+        )
         .bind(request.phaseAtClose ?? null, request.sessionId)
         .run();
 
-      log(`sessions/close: ${request.sessionId} (phase: ${request.phaseAtClose ?? 'unknown'})`);
+      // Vault writes (non-blocking — log errors but don't fail the close)
+      try {
+        const session = (await d1
+          .prepare(
+            'SELECT agent, area_topic, started_at FROM agent_sessions WHERE id = ?',
+          )
+          .bind(request.sessionId)
+          .first()) as any;
+
+        const agent = session?.agent ?? 'unknown';
+        const topic = session?.area_topic ?? 'unknown';
+        const startedAt = session?.started_at ?? '';
+        const now = new Date().toISOString();
+        const dateStr = now.slice(0, 10);
+
+        // Feedback capture
+        if (request.feedback) {
+          writeVaultFile(
+            'feedback',
+            `${dateStr}-${agent}-feedback.md`,
+            {
+              agent,
+              session_id: request.sessionId,
+              created: now,
+              status: 'active',
+            },
+            request.feedback,
+          );
+        }
+
+        // Postmortem generation (agent bailed early — not ship, not stale)
+        if (
+          request.phaseAtClose &&
+          request.phaseAtClose !== 'ship' &&
+          request.phaseAtClose !== 'stale'
+        ) {
+          const duration = startedAt
+            ? `${Math.round((Date.now() - new Date(startedAt + 'Z').getTime()) / 60000)} minutes`
+            : 'unknown';
+          const postmortemBody = [
+            '## Session Postmortem',
+            '',
+            `**Agent:** ${agent}`,
+            `**Topic:** ${topic}`,
+            `**Phase stopped at:** ${request.phaseAtClose}`,
+            `**Duration:** ${duration}`,
+            request.failureContext
+              ? `**Failure context:** ${request.failureContext}`
+              : '',
+            `**Session ID:** ${request.sessionId}`,
+          ]
+            .filter(Boolean)
+            .join('\n');
+
+          writeVaultFile(
+            'postmortems',
+            `${dateStr}-${agent}-postmortem.md`,
+            {
+              agent,
+              session_id: request.sessionId,
+              phase_at_close: request.phaseAtClose,
+              created: now,
+              status: 'active',
+            },
+            postmortemBody,
+          );
+        }
+      } catch (vaultErr: any) {
+        log(
+          `sessions/close vault write error (non-fatal): ${vaultErr.message}`,
+        );
+      }
+
+      log(
+        `sessions/close: ${request.sessionId} (phase: ${request.phaseAtClose ?? 'unknown'})`,
+      );
       jsonResponse(res, 200, { closed: true });
       return;
     } catch (err: any) {
       log(`sessions/close error: ${err.message}`);
+      jsonResponse(res, 500, { error: err.message });
+      return;
+    }
+  }
+
+  // =========================================================================
+  // Metrics — session performance + latest report for Ops Dashboard
+  // =========================================================================
+
+  // GET /api/metrics/agent-performance — session metrics + latest performance report
+  if (
+    url.pathname === '/api/metrics/agent-performance' &&
+    method === 'GET'
+  ) {
+    try {
+      const d1 = (await getSessionD1()) as any;
+      const agent = url.searchParams.get('agent') || undefined;
+      const days = parseInt(url.searchParams.get('days') || '30', 10);
+
+      // Session duration
+      const durationResult = agent
+        ? await d1
+            .prepare(
+              "SELECT agent, COUNT(*) as session_count, AVG((julianday(closed_at) - julianday(started_at)) * 86400) as avg_seconds FROM agent_sessions WHERE closed_at IS NOT NULL AND started_at >= datetime('now', '-' || ? || ' days') AND agent = ? GROUP BY agent",
+            )
+            .bind(days, agent)
+            .all()
+        : await d1
+            .prepare(
+              "SELECT agent, COUNT(*) as session_count, AVG((julianday(closed_at) - julianday(started_at)) * 86400) as avg_seconds FROM agent_sessions WHERE closed_at IS NOT NULL AND started_at >= datetime('now', '-' || ? || ' days') GROUP BY agent",
+            )
+            .bind(days)
+            .all();
+
+      // Completion rates
+      const completionResult = agent
+        ? await d1
+            .prepare(
+              "SELECT agent, COUNT(*) as total, SUM(CASE WHEN phase_at_close = 'ship' THEN 1 ELSE 0 END) as shipped, SUM(CASE WHEN phase_at_close = 'stale' THEN 1 ELSE 0 END) as stale, SUM(CASE WHEN phase_at_close NOT IN ('ship', 'stale') THEN 1 ELSE 0 END) as abandoned FROM agent_sessions WHERE closed_at IS NOT NULL AND started_at >= datetime('now', '-' || ? || ' days') AND agent = ? GROUP BY agent",
+            )
+            .bind(days, agent)
+            .all()
+        : await d1
+            .prepare(
+              "SELECT agent, COUNT(*) as total, SUM(CASE WHEN phase_at_close = 'ship' THEN 1 ELSE 0 END) as shipped, SUM(CASE WHEN phase_at_close = 'stale' THEN 1 ELSE 0 END) as stale, SUM(CASE WHEN phase_at_close NOT IN ('ship', 'stale') THEN 1 ELSE 0 END) as abandoned FROM agent_sessions WHERE closed_at IS NOT NULL AND started_at >= datetime('now', '-' || ? || ' days') GROUP BY agent",
+            )
+            .bind(days)
+            .all();
+
+      // Phase distribution
+      const distResult = await d1
+        .prepare(
+          "SELECT phase_at_close, COUNT(*) as count FROM agent_sessions WHERE closed_at IS NOT NULL AND started_at >= datetime('now', '-' || ? || ' days') GROUP BY phase_at_close",
+        )
+        .bind(days)
+        .all();
+
+      // Latest performance report
+      const reportResult = await d1
+        .prepare(
+          'SELECT * FROM performance_reports ORDER BY created_at DESC LIMIT 1',
+        )
+        .all();
+      const latestReport = reportResult.results[0] ?? null;
+
+      jsonResponse(res, 200, {
+        sessions: {
+          duration: durationResult.results,
+          completionRates: completionResult.results,
+          phaseDistribution: distResult.results,
+        },
+        latestReport: latestReport
+          ? {
+              id: latestReport.id,
+              periodStart: latestReport.period_start,
+              periodEnd: latestReport.period_end,
+              missionCount: latestReport.mission_count,
+              reportData: latestReport.report_data
+                ? JSON.parse(String(latestReport.report_data))
+                : null,
+            }
+          : null,
+      });
+      return;
+    } catch (err: any) {
+      log(`metrics/agent-performance error: ${err.message}`);
       jsonResponse(res, 500, { error: err.message });
       return;
     }
@@ -2627,7 +2992,11 @@ server.listen(PORT, HOST, () => {
   log(`Vault-query:  POST /api/tools/vault-query`);
   log(`Vault-stats:  GET  /api/tools/vault-stats`);
   log(`Vault-refresh:POST /api/tools/vault-refresh`);
+  log(`Vault-promote:POST /api/vault/promote`);
+  log(`Vault-qlist:  GET  /api/vault/quarantine`);
+  log(`Vault-qdelete:DELETE /api/vault/quarantine`);
   log(`Register:     POST /api/sessions/register`);
+  log(`Metrics:      GET  /api/metrics/agent-performance`);
   log(`Close:        POST /api/sessions/close`);
   log(`Phase:        POST /api/workflow/phase`);
   log(`Validate:     POST /api/workflow/validate`);
