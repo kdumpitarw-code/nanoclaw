@@ -22,6 +22,23 @@ import {
 import { join, dirname } from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { resolve, relative } from 'path';
+import {
+  buildImportGraph,
+  computeBlastRadius,
+} from '@alacrity/tools/import-graph';
+import {
+  buildDocGraph,
+  queryDocDeps,
+  computeDocImpact,
+  queryDocContext,
+} from '@alacrity/tools/doc-graph';
+import {
+  queryVaultGraph,
+  getVaultStats,
+  invalidateVaultCache,
+  type VaultQueryParams,
+} from '@alacrity/tools/vault-graph';
 
 const execAsync = promisify(exec);
 
@@ -100,6 +117,13 @@ const AGENTS_BASE = join(
   'alacrity_hub',
   'packages',
   'agents',
+);
+
+// Alacrity Hub repo root — used by orientation tools (blast-radius, dep-graph, doc-graph)
+const ALACRITY_HUB_ROOT = join(
+  process.env.HOME || '/root',
+  'Vibe Sphere',
+  'alacrity_hub',
 );
 
 /**
@@ -202,6 +226,7 @@ interface AsyncAgentRequest {
 
 interface NanoClawAgentConfig {
   prompt: string;
+  promptByStage?: Record<string, string>;
   modelKey: string;
   tools: string[];
   maxTokens: number;
@@ -739,7 +764,9 @@ async function updateCheckpoint(
   updates: Partial<StageCheckpoint>,
 ): Promise<void> {
   try {
-    const setClauses = Object.keys(updates).map((k) => `${k} = ?`).join(', ');
+    const setClauses = Object.keys(updates)
+      .map((k) => `${k} = ?`)
+      .join(', ');
     const values = Object.values(updates);
     await fetch(d1ProxyUrl, {
       method: 'POST',
@@ -774,7 +801,8 @@ async function decideRouting(forceCloud: boolean): Promise<RoutingDecision> {
       '.memory-pressure-state',
     );
     const pressure = readFileSync(pressureFile, 'utf-8').trim();
-    if (pressure === 'critical') return { route: 'cloud', reason: 'memory_pressure' };
+    if (pressure === 'critical')
+      return { route: 'cloud', reason: 'memory_pressure' };
   } catch {
     // File doesn't exist, continue
   }
@@ -797,7 +825,10 @@ async function decideRouting(forceCloud: boolean): Promise<RoutingDecision> {
 async function runCheckpointAwareAgent(
   req: AsyncAgentRequest,
   agentConfig: NanoClawAgentConfig,
-  toolCallback: (toolName: string, params: Record<string, unknown>) => Promise<string>,
+  toolCallback: (
+    toolName: string,
+    params: Record<string, unknown>,
+  ) => Promise<string>,
   actualCallbackPort: number,
   cloud?: { forceCloud: boolean; fallbackModel: string; apiKey: string },
 ): Promise<{
@@ -809,7 +840,11 @@ async function runCheckpointAwareAgent(
 }> {
   const startTime = Date.now();
   let totalTokens = 0;
-  const checkpointResults: Array<{ index: number; status: string; summary?: string }> = [];
+  const checkpointResults: Array<{
+    index: number;
+    status: string;
+    summary?: string;
+  }> = [];
 
   // Load checkpoints from D1
   const checkpoints = await fetchCheckpoints(
@@ -895,7 +930,11 @@ ${checkpoint.description}
 Complete this checkpoint and call checkpoint_complete with a concise summary.`;
 
     const checkpointCloud = useCloud
-      ? { forceCloud: true, fallbackModel: cloud!.fallbackModel, apiKey: cloud!.apiKey }
+      ? {
+          forceCloud: true,
+          fallbackModel: cloud!.fallbackModel,
+          apiKey: cloud!.apiKey,
+        }
       : cloud;
 
     try {
@@ -1302,11 +1341,19 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         pipelineStage,
       );
 
-      let result: AgentRunResponse & { checkpointResults?: Array<{ index: number; status: string; summary?: string }> };
+      let result: AgentRunResponse & {
+        checkpointResults?: Array<{
+          index: number;
+          status: string;
+          summary?: string;
+        }>;
+      };
 
       if (checkpoints.length > 0) {
         // Use checkpoint-aware segmented execution
-        log(`Found ${checkpoints.length} checkpoints for ${missionId}/${pipelineStage}, using segmented execution`);
+        log(
+          `Found ${checkpoints.length} checkpoints for ${missionId}/${pipelineStage}, using segmented execution`,
+        );
         result = await runCheckpointAwareAgent(
           req,
           agentConfig,
@@ -1964,6 +2011,262 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // =========================================================================
+  // Orientation Tools — uniform access for all agent contexts
+  // =========================================================================
+
+  // POST /api/tools/blast-radius — compute transitive import impact
+  if (url.pathname === '/api/tools/blast-radius' && method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const request = JSON.parse(body) as {
+        path: string;
+        maxDepth?: number;
+      };
+
+      if (!request.path) {
+        jsonResponse(res, 400, { error: 'Missing required field: path' });
+        return;
+      }
+
+      const graph = buildImportGraph(ALACRITY_HUB_ROOT);
+      const absPath = resolve(ALACRITY_HUB_ROOT, request.path);
+
+      if (!graph.has(absPath)) {
+        jsonResponse(res, 404, {
+          error: `File not found in import graph: ${request.path}`,
+        });
+        return;
+      }
+
+      const result = computeBlastRadius(
+        graph,
+        absPath,
+        ALACRITY_HUB_ROOT,
+        request.maxDepth ?? 5,
+      );
+      log(`blast-radius: ${request.path} → ${result.transitiveDependents} affected`);
+      jsonResponse(res, 200, { path: request.path, ...result });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`blast-radius error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // POST /api/tools/dep-graph — query direct dependencies
+  if (url.pathname === '/api/tools/dep-graph' && method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const request = JSON.parse(body) as {
+        path: string;
+        direction?: 'imports' | 'importedBy' | 'both';
+      };
+
+      if (!request.path) {
+        jsonResponse(res, 400, { error: 'Missing required field: path' });
+        return;
+      }
+
+      const graph = buildImportGraph(ALACRITY_HUB_ROOT);
+      const absPath = resolve(ALACRITY_HUB_ROOT, request.path);
+      const node = graph.get(absPath);
+
+      if (!node) {
+        jsonResponse(res, 404, {
+          error: `File not found in import graph: ${request.path}`,
+        });
+        return;
+      }
+
+      const direction = request.direction ?? 'both';
+      const toRel = (p: string) => relative(ALACRITY_HUB_ROOT, p);
+      const result: Record<string, unknown> = { path: toRel(absPath) };
+
+      if (direction === 'imports' || direction === 'both') {
+        result.imports = node.imports.map(toRel);
+        result.importsCount = node.imports.length;
+      }
+      if (direction === 'importedBy' || direction === 'both') {
+        result.importedBy = node.importedBy.map(toRel);
+        result.importedByCount = node.importedBy.length;
+      }
+
+      log(`dep-graph: ${request.path} (${direction})`);
+      jsonResponse(res, 200, result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`dep-graph error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // POST /api/tools/doc-deps — query documentation references
+  if (url.pathname === '/api/tools/doc-deps' && method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const request = JSON.parse(body) as {
+        path: string;
+        direction?: 'references' | 'referencedBy' | 'both';
+      };
+
+      if (!request.path) {
+        jsonResponse(res, 400, { error: 'Missing required field: path' });
+        return;
+      }
+
+      const graph = buildDocGraph(ALACRITY_HUB_ROOT);
+      const absPath = resolve(ALACRITY_HUB_ROOT, request.path);
+
+      if (!graph.has(absPath)) {
+        jsonResponse(res, 404, {
+          error: `File not found in doc graph: ${request.path}`,
+        });
+        return;
+      }
+
+      const result = queryDocDeps(
+        graph,
+        absPath,
+        ALACRITY_HUB_ROOT,
+        request.direction ?? 'both',
+      );
+      log(`doc-deps: ${request.path}`);
+      jsonResponse(res, 200, result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`doc-deps error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // POST /api/tools/doc-impact — compute documentation blast radius
+  if (url.pathname === '/api/tools/doc-impact' && method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const request = JSON.parse(body) as {
+        path: string;
+        maxDepth?: number;
+      };
+
+      if (!request.path) {
+        jsonResponse(res, 400, { error: 'Missing required field: path' });
+        return;
+      }
+
+      const graph = buildDocGraph(ALACRITY_HUB_ROOT);
+      const absPath = resolve(ALACRITY_HUB_ROOT, request.path);
+
+      if (!graph.has(absPath)) {
+        jsonResponse(res, 404, {
+          error: `File not found in doc graph: ${request.path}`,
+        });
+        return;
+      }
+
+      const result = computeDocImpact(
+        graph,
+        absPath,
+        ALACRITY_HUB_ROOT,
+        request.maxDepth ?? 3,
+      );
+      log(`doc-impact: ${request.path} → ${result.affectedDocs.length} affected`);
+      jsonResponse(res, 200, { path: request.path, ...result });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`doc-impact error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // POST /api/tools/doc-context — find relevant docs by topic
+  if (url.pathname === '/api/tools/doc-context' && method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const request = JSON.parse(body) as {
+        topic: string;
+        limit?: number;
+      };
+
+      if (!request.topic) {
+        jsonResponse(res, 400, { error: 'Missing required field: topic' });
+        return;
+      }
+
+      const graph = buildDocGraph(ALACRITY_HUB_ROOT);
+      const result = queryDocContext(
+        graph,
+        ALACRITY_HUB_ROOT,
+        request.topic,
+        request.limit ?? 10,
+      );
+      log(`doc-context: "${request.topic}" → ${result.docs.length} docs`);
+      jsonResponse(res, 200, result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`doc-context error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // POST /api/tools/vault-query — search vault notes
+  if (url.pathname === '/api/tools/vault-query' && method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const params = JSON.parse(body) as VaultQueryParams;
+
+      const results = queryVaultGraph(params);
+      log(`vault-query: ${params.query ?? '(no query)'} → ${results.length} results`);
+      jsonResponse(res, 200, { count: results.length, results });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`vault-query error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // GET /api/tools/vault-stats — vault index stats
+  if (url.pathname === '/api/tools/vault-stats' && method === 'GET') {
+    try {
+      const stats = getVaultStats();
+      jsonResponse(res, 200, stats);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`vault-stats error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // POST /api/tools/vault-refresh — invalidate vault cache
+  if (url.pathname === '/api/tools/vault-refresh' && method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const request = JSON.parse(body) as { vault?: string };
+      const target = request.vault ?? 'all';
+
+      if (target === 'all') {
+        invalidateVaultCache();
+      } else {
+        invalidateVaultCache(target);
+      }
+
+      log(`vault-refresh: ${target}`);
+      jsonResponse(res, 200, { invalidated: target });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`vault-refresh error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
   // 404
   jsonResponse(res, 404, { error: 'Not found' });
 });
@@ -2011,12 +2314,20 @@ async function replayFallbackFiles(): Promise<void> {
 
 server.listen(PORT, HOST, () => {
   log(`Hub API server listening on http://${HOST}:${PORT}`);
-  log(`Health: GET /api/health`);
-  log(`LLM:    POST /api/llm/chat`);
-  log(`RAG:    POST /api/rag/query`);
-  log(`Agent:  POST /api/agent/run`);
-  log(`Async:  POST /api/agent/run-async`);
-  log(`Intake: POST /api/mission-intake`);
+  log(`Health:       GET  /api/health`);
+  log(`LLM:          POST /api/llm/chat`);
+  log(`RAG:          POST /api/rag/query`);
+  log(`Agent:        POST /api/agent/run`);
+  log(`Async:        POST /api/agent/run-async`);
+  log(`Intake:       POST /api/mission-intake`);
+  log(`Blast-radius: POST /api/tools/blast-radius`);
+  log(`Dep-graph:    POST /api/tools/dep-graph`);
+  log(`Doc-deps:     POST /api/tools/doc-deps`);
+  log(`Doc-impact:   POST /api/tools/doc-impact`);
+  log(`Doc-context:  POST /api/tools/doc-context`);
+  log(`Vault-query:  POST /api/tools/vault-query`);
+  log(`Vault-stats:  GET  /api/tools/vault-stats`);
+  log(`Vault-refresh:POST /api/tools/vault-refresh`);
 
   // Replay any pending fallback files after a short delay
   setTimeout(
