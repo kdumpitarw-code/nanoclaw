@@ -39,6 +39,14 @@ import {
   invalidateVaultCache,
   type VaultQueryParams,
 } from '@alacrity/tools/vault-graph';
+import {
+  validateAssessmentBlock,
+  extractAssessmentBlock,
+  validatePreEditConfirmation,
+  validateShipAudit,
+  type ShipAuditState,
+  type GitState,
+} from '@alacrity/tools/validation';
 
 const execAsync = promisify(exec);
 
@@ -2045,7 +2053,9 @@ const server = createServer(async (req, res) => {
         ALACRITY_HUB_ROOT,
         request.maxDepth ?? 5,
       );
-      log(`blast-radius: ${request.path} → ${result.transitiveDependents} affected`);
+      log(
+        `blast-radius: ${request.path} → ${result.transitiveDependents} affected`,
+      );
       jsonResponse(res, 200, { path: request.path, ...result });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -2173,7 +2183,9 @@ const server = createServer(async (req, res) => {
         ALACRITY_HUB_ROOT,
         request.maxDepth ?? 3,
       );
-      log(`doc-impact: ${request.path} → ${result.affectedDocs.length} affected`);
+      log(
+        `doc-impact: ${request.path} → ${result.affectedDocs.length} affected`,
+      );
       jsonResponse(res, 200, { path: request.path, ...result });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -2221,7 +2233,9 @@ const server = createServer(async (req, res) => {
       const params = JSON.parse(body) as VaultQueryParams;
 
       const results = queryVaultGraph(params);
-      log(`vault-query: ${params.query ?? '(no query)'} → ${results.length} results`);
+      log(
+        `vault-query: ${params.query ?? '(no query)'} → ${results.length} results`,
+      );
       jsonResponse(res, 200, { count: results.length, results });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -2262,6 +2276,103 @@ const server = createServer(async (req, res) => {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       log(`vault-refresh error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
+  // =========================================================================
+  // Gate Validation — uniform enforcement for all agent contexts
+  // =========================================================================
+
+  // POST /api/workflow/validate — validate gate deliverables
+  if (url.pathname === '/api/workflow/validate' && method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const request = JSON.parse(body) as {
+        gate: 'assess' | 'pre-edit' | 'ship';
+        content?: string;
+        targetFile?: string;
+        auditState?: ShipAuditState;
+      };
+
+      if (!request.gate) {
+        jsonResponse(res, 400, { error: 'Missing required field: gate' });
+        return;
+      }
+
+      if (request.gate === 'assess') {
+        if (!request.content) {
+          jsonResponse(res, 400, {
+            error: 'Missing required field: content (assessment block text)',
+          });
+          return;
+        }
+
+        // Try to extract assessment block from larger content
+        const block = extractAssessmentBlock(request.content) ?? request.content;
+        const result = validateAssessmentBlock(block);
+
+        log(
+          `validate/assess: ${result.valid ? 'PASSED' : 'FAILED'} (${result.missingSections.length} missing, ${result.placeholderCount} placeholders)`,
+        );
+        jsonResponse(res, 200, {
+          gate: 'assess',
+          ...result,
+        });
+        return;
+      }
+
+      if (request.gate === 'pre-edit') {
+        if (!request.content) {
+          jsonResponse(res, 400, {
+            error: 'Missing required field: content (pre-edit confirmation text)',
+          });
+          return;
+        }
+
+        const result = validatePreEditConfirmation(
+          request.content,
+          request.targetFile,
+        );
+
+        log(
+          `validate/pre-edit: ${result.valid ? 'PASSED' : 'FAILED'}${result.filePath ? ` (${result.filePath})` : ''} risk=${result.risk ?? 'unknown'}`,
+        );
+        jsonResponse(res, 200, {
+          gate: 'pre-edit',
+          ...result,
+        });
+        return;
+      }
+
+      if (request.gate === 'ship') {
+        if (!request.auditState) {
+          jsonResponse(res, 400, {
+            error:
+              'Missing required field: auditState (git state, tier, doc-impact, handoff)',
+          });
+          return;
+        }
+
+        const result = validateShipAudit(request.auditState);
+
+        log(
+          `validate/ship: ${result.valid ? 'PASSED' : 'FAILED'} scope=${result.scopeCheckPassed} complete=${result.completenessCheckPassed} hygiene=${result.hygieneCheckPassed}`,
+        );
+        jsonResponse(res, 200, {
+          gate: 'ship',
+          ...result,
+        });
+        return;
+      }
+
+      jsonResponse(res, 400, {
+        error: `Unknown gate: ${request.gate}. Valid gates: assess, pre-edit, ship`,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`validate error: ${message}`);
       jsonResponse(res, 500, { error: message });
     }
     return;
@@ -2328,6 +2439,7 @@ server.listen(PORT, HOST, () => {
   log(`Vault-query:  POST /api/tools/vault-query`);
   log(`Vault-stats:  GET  /api/tools/vault-stats`);
   log(`Vault-refresh:POST /api/tools/vault-refresh`);
+  log(`Validate:     POST /api/workflow/validate`);
 
   // Replay any pending fallback files after a short delay
   setTimeout(
