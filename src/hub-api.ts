@@ -122,6 +122,7 @@ const CF_ACCESS_EXPECTED_ID = process.env.CF_ACCESS_EXPECTED_ID || '';
 const CF_ACCESS_EXPECTED_SECRET = process.env.CF_ACCESS_EXPECTED_SECRET || '';
 const AGENT_RESULTS_SECRET = process.env.AGENT_RESULTS_SECRET || '';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const HUB_D1_PROXY_URL = process.env.HUB_D1_PROXY_URL || '';
 
 // Path to the agents package on this machine
 const AGENTS_BASE = join(
@@ -138,6 +139,21 @@ const ALACRITY_HUB_ROOT = join(
   'Vibe Sphere',
   'alacrity_hub',
 );
+
+// Lazy D1 adapter for session routes (not dispatched by hub, so needs its own proxy ref)
+const agentsPkgSrc = join(ALACRITY_HUB_ROOT, 'packages', 'agents', 'src');
+let sessionD1: { prepare: (sql: string) => unknown } | null = null;
+async function getSessionD1() {
+  if (sessionD1) return sessionD1;
+  if (!HUB_D1_PROXY_URL || !AGENT_RESULTS_SECRET) {
+    throw new Error('HUB_D1_PROXY_URL and AGENT_RESULTS_SECRET required for session routes');
+  }
+  const { createD1ProxyAdapter } = await import(
+    join(agentsPkgSrc, 'd1-proxy-adapter.ts')
+  );
+  sessionD1 = createD1ProxyAdapter(HUB_D1_PROXY_URL, AGENT_RESULTS_SECRET) as typeof sessionD1;
+  return sessionD1!;
+}
 
 /**
  * Virtual key → Ollama model mapping.
@@ -2287,6 +2303,120 @@ const server = createServer(async (req, res) => {
   }
 
   // =========================================================================
+  // Session Registration — agents register work sessions, get bundled context
+  // =========================================================================
+
+  // POST /api/sessions/register — agent registers work session, gets bundled context
+  if (url.pathname === '/api/sessions/register' && method === 'POST') {
+    try {
+      const d1 = await getSessionD1() as any;
+      const body = await readBody(req);
+      const request = JSON.parse(body) as {
+        agent: string;
+        area?: { files?: string[]; topic?: string };
+      };
+
+      if (!request.agent) {
+        jsonResponse(res, 400, { error: 'Missing required field: agent' });
+        return;
+      }
+      if (!request.area?.files?.length && !request.area?.topic) {
+        jsonResponse(res, 400, { error: 'At least one of area.files or area.topic required' });
+        return;
+      }
+
+      // Clean up stale sessions
+      await d1.prepare("UPDATE agent_sessions SET closed_at = datetime('now'), phase_at_close = 'stale' WHERE closed_at IS NULL AND started_at < datetime('now', '-4 hours')").run();
+
+      // Generate session ID
+      const now = new Date();
+      const ts = now.toISOString().replace(/[-:T]/g, '').slice(0, 14);
+      const sessionId = `s_${ts}_${request.agent}`;
+
+      // Register session
+      const areaFiles = request.area?.files ? JSON.stringify(request.area.files) : null;
+      const areaTopic = request.area?.topic ?? null;
+      await d1.prepare("INSERT INTO agent_sessions (id, agent, area_files, area_topic) VALUES (?, ?, ?, ?)")
+        .bind(sessionId, request.agent, areaFiles, areaTopic)
+        .run();
+
+      // Assemble context bundle
+      // 1. Handoffs (via vault-query)
+      const handoffs = await queryVaultGraph({
+        folder: 'handoffs',
+        limit: 5,
+      });
+
+      // 2. Active sessions (exclude self)
+      const activeSessions = await d1.prepare(
+        "SELECT id, agent, area_topic, started_at FROM agent_sessions WHERE closed_at IS NULL"
+      ).all();
+      const otherSessions = activeSessions.results.filter((s: any) => s.id !== sessionId);
+
+      // 3. D1 context (errors, missions, activity) — individual queries via d1.query fallback
+      const errors = await d1.prepare(
+        "SELECT id, source, message, severity, timestamp FROM error_logs WHERE resolved = FALSE ORDER BY timestamp DESC LIMIT 10"
+      ).all();
+
+      const missions = await d1.prepare(
+        "SELECT id, title, status, completed_at FROM missions WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 5"
+      ).all();
+
+      const activity = await d1.prepare(
+        "SELECT route, model, timestamp, tokens_in, tokens_out FROM request_logs ORDER BY timestamp DESC LIMIT 10"
+      ).all();
+
+      log(`sessions/register: ${request.agent} registered session ${sessionId} (topic: ${areaTopic})`);
+
+      jsonResponse(res, 200, {
+        sessionId,
+        context: {
+          handoffs: handoffs.map((h: any) => ({
+            file: h.name || h.path,
+            date: h.date || null,
+            summary: h.title || h.name || h.path,
+          })),
+          activeSessions: otherSessions,
+          unresolvedErrors: errors.results,
+          relatedMissions: missions.results,
+          recentActivity: activity.results,
+        },
+      });
+      return;
+    } catch (err: any) {
+      log(`sessions/register error: ${err.message}`);
+      jsonResponse(res, 500, { error: err.message });
+      return;
+    }
+  }
+
+  // POST /api/sessions/close — agent closes work session
+  if (url.pathname === '/api/sessions/close' && method === 'POST') {
+    try {
+      const d1 = await getSessionD1() as any;
+      const body = await readBody(req);
+      const request = JSON.parse(body) as { sessionId: string; phaseAtClose?: string };
+
+      if (!request.sessionId) {
+        jsonResponse(res, 400, { error: 'Missing required field: sessionId' });
+        return;
+      }
+
+      await d1.prepare("UPDATE agent_sessions SET closed_at = datetime('now'), phase_at_close = ? WHERE id = ?")
+        .bind(request.phaseAtClose ?? null, request.sessionId)
+        .run();
+
+      log(`sessions/close: ${request.sessionId} (phase: ${request.phaseAtClose ?? 'unknown'})`);
+      jsonResponse(res, 200, { closed: true });
+      return;
+    } catch (err: any) {
+      log(`sessions/close error: ${err.message}`);
+      jsonResponse(res, 500, { error: err.message });
+      return;
+    }
+  }
+
+  // =========================================================================
   // Phase Serving — hub returns current lifecycle phase based on artifact state
   // =========================================================================
 
@@ -2497,6 +2627,8 @@ server.listen(PORT, HOST, () => {
   log(`Vault-query:  POST /api/tools/vault-query`);
   log(`Vault-stats:  GET  /api/tools/vault-stats`);
   log(`Vault-refresh:POST /api/tools/vault-refresh`);
+  log(`Register:     POST /api/sessions/register`);
+  log(`Close:        POST /api/sessions/close`);
   log(`Phase:        POST /api/workflow/phase`);
   log(`Validate:     POST /api/workflow/validate`);
 
