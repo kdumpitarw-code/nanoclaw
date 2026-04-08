@@ -168,11 +168,9 @@ const AGENT_VAULT_BASE = join(
   'agent',
 );
 const QUARANTINE_DIR = join(AGENT_VAULT_BASE, 'quarantine');
-const HUMAN_VAULT_PATH = process.env.HUMAN_VAULT_PATH || join(
-  process.env.HOME || '/root',
-  'Vaults',
-  'HumanVault',
-);
+const HUMAN_VAULT_PATH =
+  process.env.HUMAN_VAULT_PATH ||
+  join(process.env.HOME || '/root', 'Vaults', 'HumanVault');
 
 function writeVaultFile(
   folder: string,
@@ -287,6 +285,8 @@ interface AsyncAgentRequest {
   fallbackModel?: string;
   /** User's preferred response language (e.g. "French"). When set and not "English", injected into system prompt. */
   language?: string;
+  /** Paradigm-resolved model ID for this stage (e.g. 'qwen2.5:14b-instruct-q4_K_M'). Passed to toolDeps for artifact provenance. */
+  resolvedModel?: string;
 }
 
 // --- Agent configs: canonical source is packages/agents/canonical-configs.json ---
@@ -1323,6 +1323,7 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         'Vibe Sphere',
         'alacrity_hub',
       ),
+      resolvedModel: req.resolvedModel ?? null,
     };
     const toolHandlers = createToolHandlers(toolDeps);
 
@@ -1867,6 +1868,7 @@ const server = createServer(async (req, res) => {
         forceCloud,
         fallbackModel,
         language,
+        resolvedModel,
       } = body;
 
       if (
@@ -1915,6 +1917,7 @@ const server = createServer(async (req, res) => {
             forceCloud: forceCloud || false,
             fallbackModel: fallbackModel || '',
             language: language || undefined,
+            resolvedModel: resolvedModel || undefined,
           });
         } catch (err) {
           log(`Async agent error for ${agent}/${missionId}: ${err}`);
@@ -2360,16 +2363,25 @@ const server = createServer(async (req, res) => {
 
       if (action === 'quarantine') {
         const { noteId, title, refinedContent, suggestedTags } = body as {
-          noteId: string; title: string; refinedContent: string; suggestedTags?: string[];
+          noteId: string;
+          title: string;
+          refinedContent: string;
+          suggestedTags?: string[];
         };
         if (!noteId || !title || !refinedContent) {
-          jsonResponse(res, 400, { error: 'noteId, title, and refinedContent required' });
+          jsonResponse(res, 400, {
+            error: 'noteId, title, and refinedContent required',
+          });
           return;
         }
 
-        if (!existsSync(QUARANTINE_DIR)) mkdirSync(QUARANTINE_DIR, { recursive: true });
+        if (!existsSync(QUARANTINE_DIR))
+          mkdirSync(QUARANTINE_DIR, { recursive: true });
 
-        const safeTitle = title.replace(/[^a-zA-Z0-9_\- ]/g, '').trim().replace(/\s+/g, '-');
+        const safeTitle = title
+          .replace(/[^a-zA-Z0-9_\- ]/g, '')
+          .trim()
+          .replace(/\s+/g, '-');
         const filename = `${safeTitle}-${noteId.slice(0, 8)}.md`;
         const filePath = join(QUARANTINE_DIR, filename);
 
@@ -2382,15 +2394,21 @@ const server = createServer(async (req, res) => {
         jsonResponse(res, 201, { quarantinePath: filePath, filename });
       } else if (action === 'confirm') {
         const { quarantinePath, targetFolder } = body as {
-          noteId: string; quarantinePath: string; targetFolder: string;
+          noteId: string;
+          quarantinePath: string;
+          targetFolder: string;
         };
         if (!quarantinePath || !targetFolder) {
-          jsonResponse(res, 400, { error: 'quarantinePath and targetFolder required' });
+          jsonResponse(res, 400, {
+            error: 'quarantinePath and targetFolder required',
+          });
           return;
         }
 
         if (!existsSync(quarantinePath)) {
-          jsonResponse(res, 404, { error: `Quarantine file not found: ${quarantinePath}` });
+          jsonResponse(res, 404, {
+            error: `Quarantine file not found: ${quarantinePath}`,
+          });
           return;
         }
 
@@ -2700,10 +2718,7 @@ const server = createServer(async (req, res) => {
   // =========================================================================
 
   // GET /api/metrics/agent-performance — session metrics + latest performance report
-  if (
-    url.pathname === '/api/metrics/agent-performance' &&
-    method === 'GET'
-  ) {
+  if (url.pathname === '/api/metrics/agent-performance' && method === 'GET') {
     try {
       const d1 = (await getSessionD1()) as any;
       const agent = url.searchParams.get('agent') || undefined;
