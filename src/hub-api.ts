@@ -2203,10 +2203,30 @@ const server = createServer(async (req, res) => {
       // developer agent runs have a ready node_modules. Uses the root-level
       // pnpm lockfile via workspace resolution — cwd is apps/hub to match
       // the shipped pattern in mission-orchestrator.createWorktree().
+      //
+      // PATH augmentation: when hub-api is started by launchd, PATH is set
+      // to the plist's EnvironmentVariables.PATH (typically
+      // `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin`), which does NOT
+      // include pnpm's home-directory install location
+      // (`~/.npm-global/bin/pnpm`). Augment PATH so `pnpm` resolves whether
+      // the process is launched from a shell or from launchd. Discovered
+      // 2026-04-11 during Task 21 retry — the shipped
+      // mission-orchestrator.createWorktree() has the same implicit
+      // dependency but is dead code, so the launchd-PATH gap went unnoticed
+      // until this endpoint shipped.
       try {
+        const extraPath = join(
+          process.env.HOME || '/root',
+          '.npm-global',
+          'bin',
+        );
+        const augmentedPath = process.env.PATH
+          ? `${extraPath}:${process.env.PATH}`
+          : extraPath;
         await execAsync('pnpm install --frozen-lockfile', {
           cwd: join(worktreePath, 'apps', 'hub'),
           timeout: 180_000,
+          env: { ...process.env, PATH: augmentedPath },
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
