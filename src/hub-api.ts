@@ -805,9 +805,7 @@ async function handleCheckpointComplete(
       `checkpoint(${cp.stage}/${cp.checkpointIndex}): ${msgBody}`,
       '--allow-empty',
     ]);
-    log(
-      `checkpoint_commit: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex}`,
-    );
+    log(`checkpoint_commit: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex}`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log(
@@ -915,10 +913,7 @@ async function runAgentLoop(
     // check runs at the top of each round, so the agent sees one final round
     // after the flag is set (where it can emit a closing message) before the
     // loop actually terminates on the next iteration.
-    if (
-      req.checkpointContext &&
-      shouldCheckpointExit(req.checkpointContext)
-    ) {
+    if (req.checkpointContext && shouldCheckpointExit(req.checkpointContext)) {
       log(
         `Agent loop exiting after checkpoint_complete: ${req.checkpointContext.missionId}/${req.checkpointContext.stage}/${req.checkpointContext.checkpointIndex}`,
       );
