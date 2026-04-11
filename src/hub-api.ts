@@ -796,15 +796,19 @@ async function handleCheckpointComplete(
 ): Promise<string> {
   const cp = ctx.checkpointContext;
   if (!cp) {
-    // Agent called checkpoint_complete on a non-checkpoint dispatch. Defensive
-    // fallback: acknowledge and move on. Upstream will reject any attempt to
-    // use this as a checkpoint because no context was ever attached.
+    // Agent called checkpoint_complete on a non-checkpoint dispatch. The
+    // primary defense (filteredAgentTools in run-async) should keep this tool
+    // out of the LLM's visible toolset for non-checkpoint dispatches, so
+    // reaching here means the model hallucinated a tool call. Return an
+    // explicit error that tells the LLM to stop calling this tool and emit
+    // its final text response. The old "acknowledged" fallback looked like
+    // a success and caused the LLM to spin through rounds re-calling it.
     log(
-      'checkpoint_complete called without checkpointContext — no-op fallback',
+      'checkpoint_complete called without checkpointContext — returning error to force exit',
     );
     return JSON.stringify({
-      result: 'Checkpoint acknowledged (no context).',
-      warning: 'no-checkpoint-context',
+      error:
+        'checkpoint_complete is only valid on checkpoint-decomposed dispatches (dev_build or deploy segmented sub-steps). This dispatch has no checkpoint context. Do not call this tool again. Produce your final text response directly to complete your turn.',
     });
   }
 
@@ -1239,7 +1243,20 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
     if (req.language && req.language !== 'English') {
       systemPrompt += `\n\nAlways respond in ${req.language}. Do not switch languages unless the user explicitly asks.`;
     }
-    const tools = loadToolDefs(agentConfig.tools);
+    // `checkpoint-complete` is an intercepted tool that only makes sense on
+    // checkpoint-decomposed dispatches (dev_build/deploy segmented into
+    // sub-steps). Exposing it on non-checkpoint dispatches causes the LLM to
+    // call it as a "submit/finalize" signal on briefing/pm_spec/assess/etc.,
+    // which hits the no-op fallback in handleCheckpointComplete and doesn't
+    // set the agent-exit flag — so the LLM keeps spinning through rounds
+    // calling it again with different params until maxToolRounds is reached.
+    // Observed 2026-04-11 on a briefing dispatch that burned ~8 rounds.
+    // Canonical configs include `checkpoint-complete` on every agent, so the
+    // narrow fix is to filter it out here when there's no checkpoint context.
+    const filteredAgentTools = checkpointContext
+      ? agentConfig.tools
+      : agentConfig.tools.filter((t) => t !== 'checkpoint-complete');
+    const tools = loadToolDefs(filteredAgentTools);
 
     // Import tool handlers dynamically from the agents package
     const agentsPkgSrc = join(
