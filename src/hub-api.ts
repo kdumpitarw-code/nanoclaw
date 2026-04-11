@@ -419,29 +419,43 @@ function loadCanonicalConfigs(): Record<string, NanoClawAgentConfig> {
     const canonical = JSON.parse(raw) as Record<
       string,
       {
-        prompt: string;
-        modelKey: string;
-        tools: string[];
-        maxTokens: number;
-        oversight: string;
+        prompt?: string;
+        modelKey?: string;
+        tools?: string[];
+        maxTokens?: number;
+        oversight?: string;
       }
     >;
 
-    // Only include builder agents that NanoClaw runs
-    const builderAgents = [
-      'pm',
-      'architect',
-      'developer',
-      'qa',
-      'devops',
-      'tech-writer',
-    ];
+    // Load every agent defined in canonical-configs.json. The previous
+    // implementation used a hardcoded 6-agent allowlist (pm, architect,
+    // developer, qa, devops, tech-writer) which silently dropped any new
+    // agent added to the canonical file. Caught 2026-04-11 when the
+    // `assess` stage was dispatched to agent `assessor` and NanoClaw
+    // returned "Unknown agent: assessor" — assessor was defined in the
+    // canonical file but not in the allowlist. NANOCLAW_EXTENSIONS already
+    // handles missing-agent fallback (maxToolRounds defaults to 10), so
+    // there's no reason to maintain a second source of truth. Canonical
+    // configs is the source of truth; NanoClaw runs what it finds there.
+    //
+    // Agents without a `tools` array or other required fields are skipped
+    // with a warning — defensive against non-agent entries (e.g. schema
+    // blocks, metadata, future additions to canonical-configs.json that
+    // are structurally different).
     const configs: Record<string, NanoClawAgentConfig> = {};
+    const skipped: string[] = [];
 
-    for (const name of builderAgents) {
-      const base = canonical[name];
-      if (!base) {
-        log(`Warning: agent "${name}" not found in canonical configs`);
+    for (const [name, base] of Object.entries(canonical)) {
+      if (
+        !base ||
+        typeof base !== 'object' ||
+        typeof base.prompt !== 'string' ||
+        typeof base.modelKey !== 'string' ||
+        !Array.isArray(base.tools) ||
+        typeof base.maxTokens !== 'number' ||
+        typeof base.oversight !== 'string'
+      ) {
+        skipped.push(name);
         continue;
       }
       const ext = NANOCLAW_EXTENSIONS[name] || { maxToolRounds: 10 };
@@ -456,7 +470,11 @@ function loadCanonicalConfigs(): Record<string, NanoClawAgentConfig> {
       };
     }
 
-    log(`Loaded canonical configs for ${Object.keys(configs).length} agents`);
+    log(
+      `Loaded canonical configs for ${Object.keys(configs).length} agents${
+        skipped.length > 0 ? ` (skipped ${skipped.length}: ${skipped.join(', ')})` : ''
+      }`,
+    );
     return configs;
   } catch (err) {
     log(`Error loading canonical configs: ${err}. Falling back to empty.`);
