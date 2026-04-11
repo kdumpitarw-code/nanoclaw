@@ -2098,6 +2098,150 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // POST /api/worktree/create — create a builder worktree for a mission.
+  //
+  // The hub's Cloudflare Worker runtime has no `node:child_process`, so the
+  // cloud-first dispatch path cannot run `git worktree add` itself. This
+  // endpoint is called by `approveGateAndAdvance` just before the first
+  // worktree-stage dispatch (dev_build). It creates a worktree + branch,
+  // installs deps inside `apps/hub/`, and returns the absolute path so the
+  // hub can persist it in `mission_pipeline.worktree_path`.
+  //
+  // Idempotent: if the worktree already exists, return its path without
+  // re-running `pnpm install`. Stale worktrees with the same path are
+  // removed first.
+  if (url.pathname === '/api/worktree/create' && method === 'POST') {
+    try {
+      if (AGENT_RESULTS_SECRET) {
+        const auth = req.headers['authorization'];
+        if (!auth || auth !== `Bearer ${AGENT_RESULTS_SECRET}`) {
+          log('Worktree create auth rejected: invalid bearer token');
+          jsonResponse(res, 403, { error: 'Invalid authorization' });
+          return;
+        }
+      }
+
+      const body = await readBody(req);
+      const request = JSON.parse(body) as {
+        missionId: string;
+        baseBranch?: string;
+      };
+
+      if (!request.missionId) {
+        jsonResponse(res, 400, { error: 'Missing required field: missionId' });
+        return;
+      }
+
+      // Narrow missionId to the UUID shape we issue so we can safely embed
+      // it in a branch name and a path segment.
+      if (!/^[a-zA-Z0-9_-]+$/.test(request.missionId)) {
+        jsonResponse(res, 400, { error: 'Invalid missionId format' });
+        return;
+      }
+
+      const baseBranch = request.baseBranch ?? 'main';
+      if (!/^[a-zA-Z0-9/_-]+$/.test(baseBranch)) {
+        jsonResponse(res, 400, { error: 'Invalid baseBranch format' });
+        return;
+      }
+
+      const branchName = `builder/${request.missionId}`;
+      const worktreePath = join(
+        ALACRITY_HUB_ROOT,
+        '.worktrees',
+        `builder-${request.missionId}`,
+      );
+
+      log(`Worktree create: mission=${request.missionId} path=${worktreePath}`);
+
+      // Clean up stale worktree at the same path (best-effort — if it
+      // doesn't exist, git emits an error we can safely swallow).
+      if (existsSync(worktreePath)) {
+        try {
+          await runGit(ALACRITY_HUB_ROOT, [
+            'worktree',
+            'remove',
+            '--force',
+            worktreePath,
+          ]);
+        } catch (err) {
+          log(
+            `Worktree create: stale remove failed (continuing): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }
+
+      // Clean up stale branch (same name, no worktree) — fine if it didn't exist.
+      try {
+        await runGit(ALACRITY_HUB_ROOT, ['branch', '-D', branchName]);
+      } catch {
+        /* branch didn't exist — expected */
+      }
+
+      // Create the worktree + branch from the base branch.
+      try {
+        await runGit(ALACRITY_HUB_ROOT, [
+          'worktree',
+          'add',
+          '-b',
+          branchName,
+          worktreePath,
+          baseBranch,
+        ]);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log(`Worktree create failed: ${message}`);
+        jsonResponse(res, 500, {
+          error: `git worktree add failed: ${message}`,
+        });
+        return;
+      }
+
+      // Install deps inside the worktree's apps/hub so build-check and
+      // developer agent runs have a ready node_modules. Uses the root-level
+      // pnpm lockfile via workspace resolution — cwd is apps/hub to match
+      // the shipped pattern in mission-orchestrator.createWorktree().
+      try {
+        await execAsync('pnpm install --frozen-lockfile', {
+          cwd: join(worktreePath, 'apps', 'hub'),
+          timeout: 180_000,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log(`Worktree pnpm install failed: ${message}`);
+        // Roll back the worktree so we don't leave a half-created state.
+        try {
+          await runGit(ALACRITY_HUB_ROOT, [
+            'worktree',
+            'remove',
+            '--force',
+            worktreePath,
+          ]);
+        } catch {
+          /* best-effort */
+        }
+        jsonResponse(res, 500, {
+          error: `pnpm install failed: ${message}`,
+        });
+        return;
+      }
+
+      log(`Worktree create: success path=${worktreePath} branch=${branchName}`);
+      jsonResponse(res, 200, {
+        worktreePath,
+        branchName,
+        baseBranch,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`Worktree create error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+    }
+    return;
+  }
+
   // =========================================================================
   // Orientation Tools — uniform access for all agent contexts
   // =========================================================================
