@@ -2432,31 +2432,43 @@ const server = createServer(async (req, res) => {
           content: string;
         };
         if (!noteId || !title || !content) {
-          jsonResponse(res, 400, { error: 'noteId, title, and content required' });
+          jsonResponse(res, 400, {
+            error: 'noteId, title, and content required',
+          });
           return;
         }
 
         // Build simple LLM caller for promoter
-        const callLLMSimple = async (messages: Array<{ role: string; content: string }>): Promise<string> => {
+        const callLLMSimple = async (
+          messages: Array<{ role: string; content: string }>,
+        ): Promise<string> => {
           const model = resolveModel('local-reasoning');
-          const llmRes = await fetch(`${PORTKEY_BASE_URL}/v1/chat/completions`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-portkey-provider': 'ollama',
-              'x-portkey-custom-host': OLLAMA_HOST,
+          const llmRes = await fetch(
+            `${PORTKEY_BASE_URL}/v1/chat/completions`,
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-portkey-provider': 'ollama',
+                'x-portkey-custom-host': OLLAMA_HOST,
+              },
+              body: JSON.stringify({ model, messages, max_tokens: 4096 }),
             },
-            body: JSON.stringify({ model, messages, max_tokens: 4096 }),
-          });
+          );
           if (!llmRes.ok) throw new Error(`LLM call failed: ${llmRes.status}`);
-          const data = await llmRes.json() as any;
+          const data = (await llmRes.json()) as any;
           return data.choices?.[0]?.message?.content ?? '';
         };
 
         const auditLog = (entry: string) => log(`vault-refine: ${entry}`);
 
         const { refineNote } = await import(join(agentsPkgSrc, 'promoter.ts'));
-        const proposal = await refineNote(title, content, callLLMSimple, auditLog);
+        const proposal = await refineNote(
+          title,
+          content,
+          callLLMSimple,
+          auditLog,
+        );
 
         log(`vault-promote: refined note "${title}"`);
         jsonResponse(res, 200, { success: true, proposal });
