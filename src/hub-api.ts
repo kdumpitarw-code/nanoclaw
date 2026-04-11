@@ -72,6 +72,13 @@ if (existsSync(envPath)) {
 
 const PORT = parseInt(process.env.HUB_API_PORT || '4100', 10);
 const HOST = process.env.HUB_API_HOST || '127.0.0.1';
+
+// Identity stamp for this NanoClaw process instance. Reported on /api/health
+// so the hub can notice when NanoClaw has restarted (crash, reboot, launchd
+// kickstart) and reclaim any stage_checkpoints rows that were marked
+// in_progress by a prior, now-dead instance. See checkpoint-layer-v2 design.
+const BOOT_EPOCH = Date.now();
+
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
 const PORTKEY_BASE_URL =
   process.env.PORTKEY_BASE_URL || 'http://127.0.0.1:8787';
@@ -1597,6 +1604,7 @@ const server = createServer(async (req, res) => {
       service: 'nanoclaw-hub-api',
       port: PORT,
       uptime: process.uptime(),
+      boot_epoch: BOOT_EPOCH,
       concurrency: {
         active: agentSemaphore.active,
         queued: agentSemaphore.queued,
