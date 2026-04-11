@@ -52,6 +52,7 @@ import {
   inferPhase,
   type ArtifactState,
 } from '@alacrity/tools/lifecycle-parser';
+import { runGit } from './git-helpers.js';
 
 const execAsync = promisify(exec);
 
@@ -228,6 +229,25 @@ interface ToolDefinition {
   parameters?: Record<string, unknown>;
 }
 
+/**
+ * Checkpoint context passed through the agent loop when the hub dispatches a
+ * single checkpoint (checkpoint-layer v2). Presence of this field is what
+ * distinguishes a checkpoint dispatch from a plain whole-stage dispatch.
+ *
+ * When set, the intercepted `checkpoint_complete` handler uses it to:
+ *   1. Commit the worktree via runGit
+ *   2. POST the completion back to the hub with handoff metadata
+ *   3. Signal the agent loop to exit (one dispatch = one checkpoint)
+ */
+interface CheckpointContext {
+  missionId: string;
+  stage: string;
+  checkpointIndex: number;
+  worktreePath: string;
+  resultsUrl: string;
+  resultsAuth: string;
+}
+
 interface AgentRunRequest {
   model: string;
   system_prompt: string;
@@ -238,6 +258,8 @@ interface AgentRunRequest {
   container?: Record<string, unknown>;
   tool_callback_url: string;
   cloud?: { forceCloud: boolean; fallbackModel: string; apiKey: string };
+  /** Present iff this dispatch is a single-checkpoint run (v2). */
+  checkpointContext?: CheckpointContext;
 }
 
 interface AgentRunResponse {
@@ -245,6 +267,13 @@ interface AgentRunResponse {
   model: string;
   tokensUsed: number;
   duration: number;
+  /**
+   * Set to `true` by runAgentLoop when the loop exited because the agent
+   * called `checkpoint_complete`. Signals to the caller (runAsyncAgent) that
+   * the intercepted handler already POSTed results back to the hub, so the
+   * normal post-loop results callback must be skipped to avoid duplicates.
+   */
+  checkpointCompleted?: boolean;
 }
 
 interface ChatMessage {
@@ -294,6 +323,14 @@ interface AsyncAgentRequest {
   language?: string;
   /** Paradigm-resolved model ID for this stage (e.g. 'qwen2.5:14b-instruct-q4_K_M'). Passed to toolDeps for artifact provenance. */
   resolvedModel?: string;
+  /**
+   * Checkpoint v2: present when the hub is dispatching a single checkpoint.
+   * Together with `worktreePath`, these fields route the dispatch through
+   * the intercepted-checkpoint-complete path instead of the legacy whole-stage
+   * execution.
+   */
+  checkpointIndex?: number;
+  worktreePath?: string;
 }
 
 // --- Agent configs: canonical source is packages/agents/canonical-configs.json ---
@@ -630,32 +667,71 @@ async function executeToolCallback(
 // Intercepted tools — handled locally in hub-api, not sent to callback server
 const INTERCEPTED_TOOLS = new Set(['checkpoint_complete', 'preflight_rerun']);
 
+// --- Agent-loop exit flags (checkpoint v2, Task 16) ---
+//
+// When the intercepted `checkpoint_complete` handler fires, the agent must
+// stop calling tools — one dispatch equals one checkpoint. Between tool-call
+// rounds, runAgentLoop checks this map. If a flag is set for the current
+// checkpoint key, the loop exits cleanly.
+//
+// Key shape: `${missionId}:${stage}:${checkpointIndex}`. Non-checkpoint
+// dispatches never set or read this map.
+
+const agentExitFlags = new Map<string, boolean>();
+
+function checkpointExitKey(ctx: CheckpointContext): string {
+  return `${ctx.missionId}:${ctx.stage}:${ctx.checkpointIndex}`;
+}
+
+function setCheckpointExit(ctx: CheckpointContext): void {
+  agentExitFlags.set(checkpointExitKey(ctx), true);
+}
+
+function shouldCheckpointExit(ctx: CheckpointContext): boolean {
+  return agentExitFlags.get(checkpointExitKey(ctx)) === true;
+}
+
+function clearCheckpointExit(ctx: CheckpointContext): void {
+  agentExitFlags.delete(checkpointExitKey(ctx));
+}
+
+/**
+ * Context passed to intercepted tool handlers. All fields are optional —
+ * only checkpoint_complete needs the checkpoint context, only preflight_rerun
+ * needs pipelineStage/missionId. A single handler call may use any subset.
+ */
+interface InterceptedToolContext {
+  missionId?: string;
+  pipelineStage?: string;
+  checkpointContext?: CheckpointContext;
+  /** Running token count as of the current tool call (for telemetry). */
+  tokensUsedSoFar?: number;
+  /** Model ID that produced the current tool call (for telemetry). */
+  currentModel?: string;
+}
+
 /**
  * Handle intercepted tools locally without calling the callback server.
+ *
+ * `checkpoint_complete` (v2): the critical handoff point. Validates the
+ * handoff payload, commits the worktree, POSTs completion back to the hub's
+ * /api/agent-results with checkpoint metadata (the hub's observer writes the
+ * D1 transition), and sets the agent-exit flag. The agent will be forced to
+ * exit the tool loop on the next round.
+ *
+ * `preflight_rerun`: re-runs the preflight script for the current mission/
+ * stage and returns its output to the agent.
  */
 async function handleInterceptedTool(
   toolName: string,
   params: Record<string, unknown>,
-  req?: { pipelineStage?: string; missionId?: string },
+  ctx: InterceptedToolContext = {},
 ): Promise<string> {
   if (toolName === 'checkpoint_complete') {
-    // Truncate summary to ~200 tokens (roughly 800 chars)
-    let summary = String(params.summary ?? '');
-    if (summary.length > 800) {
-      const truncated = summary.slice(0, 800);
-      const lastSentence = truncated.lastIndexOf('.');
-      summary =
-        lastSentence > 400 ? truncated.slice(0, lastSentence + 1) : truncated;
-    }
-    return JSON.stringify({
-      result: 'Checkpoint marked complete.',
-      summary_stored: true,
-      truncated: summary.length < String(params.summary ?? '').length,
-    });
+    return handleCheckpointComplete(params, ctx);
   }
 
   if (toolName === 'preflight_rerun') {
-    // Re-run preflight script
     const scriptPath = join(
       process.env.HUB_ROOT ??
         join(process.env.HOME || '/root', 'Vibe Sphere', 'alacrity_hub'),
@@ -663,8 +739,8 @@ async function handleInterceptedTool(
       'preflight.sh',
     );
     try {
-      const stage = req?.pipelineStage ?? 'unknown';
-      const missionId = req?.missionId ?? 'unknown';
+      const stage = ctx.pipelineStage ?? 'unknown';
+      const missionId = ctx.missionId ?? 'unknown';
       const { stdout } = await execAsync(
         `bash "${scriptPath}" "${stage}" "${missionId}"`,
         { timeout: 30000 },
@@ -679,7 +755,140 @@ async function handleInterceptedTool(
 }
 
 /**
+ * Inner handler for `checkpoint_complete`. Split out so the control flow is
+ * easier to read than a nested if-block. See checkpoint-layer-v2 spec §7 for
+ * the full contract.
+ *
+ * Invariants enforced here:
+ *   - Summary is truncated to 1000 chars before being stored anywhere.
+ *   - Git commit happens BEFORE the D1 write (durability fence). If the
+ *     commit fails, the completion is not reported and the agent sees the
+ *     error — the checkpoint stays in_progress and the orphan scan will
+ *     eventually reclaim it for a retry.
+ *   - The hub observer branch in /api/agent-results writes the D1 transition
+ *     using the bootEpoch carried in the metadata as the WHERE-clause fence.
+ *     This handler does not write D1 directly — see the "cubicle-worker"
+ *     design: NanoClaw is stateless and only reports its identity.
+ */
+async function handleCheckpointComplete(
+  params: Record<string, unknown>,
+  ctx: InterceptedToolContext,
+): Promise<string> {
+  const cp = ctx.checkpointContext;
+  if (!cp) {
+    // Agent called checkpoint_complete on a non-checkpoint dispatch. Defensive
+    // fallback: acknowledge and move on. Upstream will reject any attempt to
+    // use this as a checkpoint because no context was ever attached.
+    log(
+      'checkpoint_complete called without checkpointContext — no-op fallback',
+    );
+    return JSON.stringify({
+      result: 'Checkpoint acknowledged (no context).',
+      warning: 'no-checkpoint-context',
+    });
+  }
+
+  const rawSummary = String(params.summary ?? '');
+  const summary = rawSummary.slice(0, 1000);
+  const handoff =
+    typeof params.handoff === 'object' && params.handoff !== null
+      ? (params.handoff as Record<string, unknown>)
+      : {};
+
+  // --- 1. Commit the worktree (durability fence) ---
+  try {
+    await runGit(cp.worktreePath, ['add', '-A']);
+    const msgBody = summary.slice(0, 72) || `(no summary)`;
+    await runGit(cp.worktreePath, [
+      'commit',
+      '-m',
+      `checkpoint(${cp.stage}/${cp.checkpointIndex}): ${msgBody}`,
+      '--allow-empty',
+    ]);
+    log(
+      `checkpoint_commit: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex}`,
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(
+      `checkpoint_commit_failed: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex}: ${msg}`,
+    );
+    // Surface the error to the agent. The checkpoint row stays in_progress;
+    // the orphan scan will reclaim it on the next epoch change.
+    return JSON.stringify({
+      error: `checkpoint commit failed: ${msg}`,
+      retryable: true,
+    });
+  }
+
+  // --- 2. POST completion back to the hub ---
+  //
+  // The hub's /api/agent-results observer branch reads metadata.checkpoint and
+  // writes the D1 transition. We never touch D1 directly from NanoClaw.
+  const resultPayload: Record<string, unknown> = {
+    missionId: cp.missionId,
+    pipelineStage: cp.stage,
+    status: 'success',
+    modelUsed: ctx.currentModel ?? null,
+    metadata: {
+      checkpoint: {
+        checkpointIndex: cp.checkpointIndex,
+        bootEpoch: BOOT_EPOCH,
+        summary,
+        handoff,
+        tokensUsed: ctx.tokensUsedSoFar ?? 0,
+        modelUsed: ctx.currentModel ?? null,
+      },
+    },
+    auditEntries: [
+      {
+        agentName: 'nanoclaw',
+        actionType: 'checkpoint_complete',
+        actionDetail: `Checkpoint ${cp.stage}/${cp.checkpointIndex} complete: ${summary.slice(0, 200)}`,
+        target: 'builder-pipeline',
+        result: 'success',
+        missionId: cp.missionId,
+        metadata: {
+          checkpointIndex: cp.checkpointIndex,
+          bootEpoch: BOOT_EPOCH,
+          tokensUsed: ctx.tokensUsedSoFar ?? 0,
+        },
+      },
+    ],
+  };
+
+  try {
+    await postResults(cp.resultsUrl, cp.resultsAuth, resultPayload);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(
+      `checkpoint_complete_post_failed: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex}: ${msg}`,
+    );
+    // postResults already has its own retry + fallback-file logic; if it still
+    // threw, the fallback file has been written. We set the exit flag anyway
+    // so the agent stops calling tools — the cubicle-worker pattern means the
+    // next dispatch's orphan-scan reconciliation handles the "callback never
+    // landed" case (the commit is durable on the worktree).
+  }
+
+  // --- 3. Set the exit flag so runAgentLoop terminates on the next round ---
+  setCheckpointExit(cp);
+
+  return JSON.stringify({
+    result:
+      'Checkpoint marked complete. Output a single final message and stop calling tools.',
+    summary_stored: true,
+    truncated: rawSummary.length > summary.length,
+  });
+}
+
+/**
  * Run the agent loop: call LLM, execute tool calls, repeat until done.
+ *
+ * Checkpoint v2: when `req.checkpointContext` is set, the intercepted
+ * `checkpoint_complete` tool can set an exit flag mid-round. Between rounds
+ * this loop checks the flag and exits cleanly, returning with
+ * `checkpointCompleted: true` so the caller knows not to double-post results.
  */
 async function runAgentLoop(
   req: AgentRunRequest,
@@ -688,6 +897,13 @@ async function runAgentLoop(
   const maxRounds = maxToolRounds ?? MAX_TOOL_ROUNDS;
   const startTime = Date.now();
   let totalTokens = 0;
+  let lastResolvedModel = resolveModel(req.model);
+
+  // Clear any stale exit flag for this checkpoint on entry — defensive against
+  // a prior aborted dispatch leaving its flag behind.
+  if (req.checkpointContext) {
+    clearCheckpointExit(req.checkpointContext);
+  }
 
   const messages: ChatMessage[] = [
     { role: 'system', content: req.system_prompt },
@@ -695,7 +911,32 @@ async function runAgentLoop(
   ];
 
   for (let round = 0; round < maxRounds; round++) {
+    // Checkpoint v2: honor the exit flag set by checkpoint_complete. This
+    // check runs at the top of each round, so the agent sees one final round
+    // after the flag is set (where it can emit a closing message) before the
+    // loop actually terminates on the next iteration.
+    if (
+      req.checkpointContext &&
+      shouldCheckpointExit(req.checkpointContext)
+    ) {
+      log(
+        `Agent loop exiting after checkpoint_complete: ${req.checkpointContext.missionId}/${req.checkpointContext.stage}/${req.checkpointContext.checkpointIndex}`,
+      );
+      clearCheckpointExit(req.checkpointContext);
+      const lastAssistant = messages
+        .filter((m) => m.role === 'assistant' && m.content)
+        .pop();
+      return {
+        content: lastAssistant?.content ?? 'Checkpoint complete.',
+        model: lastResolvedModel,
+        tokensUsed: totalTokens,
+        duration: Date.now() - startTime,
+        checkpointCompleted: true,
+      };
+    }
+
     const resolvedModel = resolveModel(req.model);
+    lastResolvedModel = resolvedModel;
     log(
       `Round ${round + 1}: calling LLM (${messages.length} messages, model=${req.model} → ${resolvedModel})`,
     );
@@ -711,6 +952,9 @@ async function runAgentLoop(
 
     if (completion.usage) {
       totalTokens += completion.usage.total_tokens;
+    }
+    if (completion.model) {
+      lastResolvedModel = completion.model;
     }
 
     const choice = completion.choices[0];
@@ -754,7 +998,13 @@ async function runAgentLoop(
 
       // Intercepted tools — handle locally, don't send to callback server
       if (INTERCEPTED_TOOLS.has(toolName)) {
-        const interceptResult = await handleInterceptedTool(toolName, params);
+        const interceptResult = await handleInterceptedTool(toolName, params, {
+          missionId: req.checkpointContext?.missionId,
+          pipelineStage: req.checkpointContext?.stage,
+          checkpointContext: req.checkpointContext,
+          tokensUsedSoFar: totalTokens,
+          currentModel: lastResolvedModel,
+        });
         result = { result: interceptResult };
       } else {
         result = await executeToolCallback(
@@ -1241,7 +1491,31 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
     resultsAuth,
     d1ProxyUrl,
     d1ProxyAuth,
+    checkpointIndex,
+    worktreePath,
   } = req;
+
+  // Build the checkpoint context for v2 dispatches. If checkpointIndex is
+  // present but worktreePath isn't, we log and fall through to non-checkpoint
+  // execution — the hub is responsible for pairing the two, and running
+  // checkpoint stages without a worktree to commit into is undefined.
+  let checkpointContext: CheckpointContext | undefined;
+  if (checkpointIndex !== undefined) {
+    if (!worktreePath) {
+      log(
+        `checkpoint dispatch ${missionId}/${pipelineStage}/${checkpointIndex} missing worktreePath — falling back to non-checkpoint execution`,
+      );
+    } else {
+      checkpointContext = {
+        missionId,
+        stage: pipelineStage,
+        checkpointIndex,
+        worktreePath,
+        resultsUrl,
+        resultsAuth,
+      };
+    }
+  }
 
   const agentConfig = AGENT_CONFIGS[agent];
   if (!agentConfig) {
@@ -1409,14 +1683,6 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
           : undefined;
 
     try {
-      // Check if checkpoints exist for this mission+stage
-      const checkpoints = await fetchCheckpoints(
-        d1ProxyUrl,
-        d1ProxyAuth,
-        missionId,
-        pipelineStage,
-      );
-
       let result: AgentRunResponse & {
         checkpointResults?: Array<{
           index: number;
@@ -1425,25 +1691,25 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         }>;
       };
 
-      if (checkpoints.length > 0) {
-        // Use checkpoint-aware segmented execution
+      if (checkpointContext) {
+        // Checkpoint v2 path: hub has dispatched a single checkpoint with
+        // metadata. Skip fetchCheckpoints entirely — the hub is the
+        // decomposer, NanoClaw is the stateless executor. The intercepted
+        // checkpoint_complete handler will commit the worktree and POST
+        // results directly when the agent finishes.
         log(
-          `Found ${checkpoints.length} checkpoints for ${missionId}/${pipelineStage}, using segmented execution`,
+          `Checkpoint v2 dispatch: ${missionId}/${pipelineStage}/${checkpointContext.checkpointIndex} (worktree=${worktreePath})`,
         );
-        result = await runCheckpointAwareAgent(
-          req,
-          agentConfig,
-          toolCallback,
-          actualPort,
-          cloud,
-        );
-      } else {
-        // Standard agent loop (no checkpoints)
         result = await runAgentLoop(
           {
             model: agentConfig.modelKey,
             system_prompt: systemPrompt,
-            user_message: JSON.stringify({ missionId }),
+            user_message: JSON.stringify({
+              missionId,
+              stage: pipelineStage,
+              checkpointIndex: checkpointContext.checkpointIndex,
+              worktreePath,
+            }),
             tools,
             max_tokens: agentConfig.maxTokens,
             portkey: {
@@ -1453,9 +1719,54 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
             },
             tool_callback_url: `http://127.0.0.1:${actualPort}/tool-callback`,
             cloud,
+            checkpointContext,
           },
           agentConfig.maxToolRounds,
         );
+      } else {
+        // Legacy path: check for checkpoints (dormant pre-v2 code, kept for
+        // backward-compat with any stale dispatch that predates v2) and fall
+        // through to the plain agent loop otherwise.
+        const checkpoints = await fetchCheckpoints(
+          d1ProxyUrl,
+          d1ProxyAuth,
+          missionId,
+          pipelineStage,
+        );
+
+        if (checkpoints.length > 0) {
+          // Use checkpoint-aware segmented execution (dormant — Task 17 will
+          // remove this branch once v2 is validated end-to-end).
+          log(
+            `Found ${checkpoints.length} checkpoints for ${missionId}/${pipelineStage}, using legacy segmented execution`,
+          );
+          result = await runCheckpointAwareAgent(
+            req,
+            agentConfig,
+            toolCallback,
+            actualPort,
+            cloud,
+          );
+        } else {
+          // Standard agent loop (no checkpoints)
+          result = await runAgentLoop(
+            {
+              model: agentConfig.modelKey,
+              system_prompt: systemPrompt,
+              user_message: JSON.stringify({ missionId }),
+              tools,
+              max_tokens: agentConfig.maxTokens,
+              portkey: {
+                base_url: PORTKEY_BASE_URL,
+                api_key: PORTKEY_API_KEY,
+                virtual_key: agentConfig.modelKey,
+              },
+              tool_callback_url: `http://127.0.0.1:${actualPort}/tool-callback`,
+              cloud,
+            },
+            agentConfig.maxToolRounds,
+          );
+        }
       }
 
       const duration = Date.now() - startTime;
@@ -1548,7 +1859,17 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         };
       }
 
-      await postResults(resultsUrl, resultsAuth, resultPayload);
+      // Checkpoint v2: if runAgentLoop exited because checkpoint_complete
+      // fired, the intercepted handler already POSTed results to the hub
+      // with the checkpoint metadata. Skip the normal post-loop POST to
+      // avoid a duplicate that would confuse the hub observer.
+      if (result.checkpointCompleted) {
+        log(
+          `checkpoint_complete already posted results for ${missionId}/${pipelineStage}; skipping normal post-loop POST`,
+        );
+      } else {
+        await postResults(resultsUrl, resultsAuth, resultPayload);
+      }
     } finally {
       callbackServer.close();
     }
@@ -1877,6 +2198,9 @@ const server = createServer(async (req, res) => {
         fallbackModel,
         language,
         resolvedModel,
+        checkpointIndex,
+        worktreePath,
+        metadata,
       } = body;
 
       if (
@@ -1892,6 +2216,19 @@ const server = createServer(async (req, res) => {
         });
         return;
       }
+
+      // Checkpoint v2: checkpointIndex + worktreePath may come at the top
+      // level of the body OR nested under metadata.{...}. Accept either
+      // shape so the hub's dispatchCheckpoint is free to evolve without a
+      // lock-step NanoClaw deploy.
+      const resolvedCheckpointIndex: number | undefined =
+        typeof checkpointIndex === 'number'
+          ? checkpointIndex
+          : typeof metadata?.checkpointIndex === 'number'
+            ? metadata.checkpointIndex
+            : undefined;
+      const resolvedWorktreePath: string | undefined =
+        worktreePath || metadata?.worktreePath || undefined;
 
       // Return 202 immediately, run agent in background
       const queuePos = agentSemaphore.queued;
@@ -1926,6 +2263,8 @@ const server = createServer(async (req, res) => {
             fallbackModel: fallbackModel || '',
             language: language || undefined,
             resolvedModel: resolvedModel || undefined,
+            checkpointIndex: resolvedCheckpointIndex,
+            worktreePath: resolvedWorktreePath,
           });
         } catch (err) {
           log(`Async agent error for ${agent}/${missionId}: ${err}`);
