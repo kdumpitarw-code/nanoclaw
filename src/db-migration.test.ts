@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -14,7 +14,7 @@ describe('database migrations', () => {
       fs.mkdirSync(path.join(tempDir, 'store'), { recursive: true });
 
       const dbPath = path.join(tempDir, 'store', 'messages.db');
-      const legacyDb = new Database(dbPath);
+      const legacyDb = new DatabaseSync(dbPath);
       legacyDb.exec(`
         CREATE TABLE chats (
           jid TEXT PRIMARY KEY,

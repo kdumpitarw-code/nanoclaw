@@ -1,4 +1,12 @@
-import Database from 'better-sqlite3';
+// Node's built-in sqlite driver. Chosen over better-sqlite3 because
+// better-sqlite3 requires node-gyp + make at install time, and node-gyp
+// doesn't quote paths with spaces (the NanoClaw repo lives under
+// ~/Vibe Sphere/). node:sqlite has no native build step and a nearly
+// drop-in API: prepare/exec/close are identical. It was added in Node
+// v22.5 behind a flag and is stable/unflagged in Node v24+ (our engines
+// minimum is 20, but the local Mac Mini runs 24.14+). Marked experimental
+// by Node — acceptable for NanoClaw's single-user scope.
+import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import fs from 'fs';
 import path from 'path';
 
@@ -12,9 +20,9 @@ import {
   TaskRunLog,
 } from './types.js';
 
-let db: Database.Database;
+let db: DatabaseSync;
 
-function createSchema(database: Database.Database): void {
+function createSchema(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,
@@ -152,7 +160,7 @@ export function initDatabase(): void {
   const dbPath = path.join(STORE_DIR, 'messages.db');
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
-  db = new Database(dbPath);
+  db = new DatabaseSync(dbPath);
   createSchema(db);
 
   // Migrate from JSON files if they exist
@@ -161,7 +169,7 @@ export function initDatabase(): void {
 
 /** @internal - for tests only. Creates a fresh in-memory database. */
 export function _initTestDatabase(): void {
-  db = new Database(':memory:');
+  db = new DatabaseSync(':memory:');
   createSchema(db);
 }
 
@@ -244,7 +252,7 @@ export function getAllChats(): ChatInfo[] {
     ORDER BY last_message_time DESC
   `,
     )
-    .all() as ChatInfo[];
+    .all() as unknown as ChatInfo[];
 }
 
 /**
@@ -340,7 +348,12 @@ export function getNewMessages(
 
   const rows = db
     .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`, limit) as NewMessage[];
+    .all(
+      lastTimestamp,
+      ...jids,
+      `${botPrefix}:%`,
+      limit,
+    ) as unknown as NewMessage[];
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {
@@ -372,7 +385,12 @@ export function getMessagesSince(
   `;
   return db
     .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+    .all(
+      chatJid,
+      sinceTimestamp,
+      `${botPrefix}:%`,
+      limit,
+    ) as unknown as NewMessage[];
 }
 
 export function getLastBotMessageTimestamp(
@@ -422,13 +440,13 @@ export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
     .prepare(
       'SELECT * FROM scheduled_tasks WHERE group_folder = ? ORDER BY created_at DESC',
     )
-    .all(groupFolder) as ScheduledTask[];
+    .all(groupFolder) as unknown as ScheduledTask[];
 }
 
 export function getAllTasks(): ScheduledTask[] {
   return db
     .prepare('SELECT * FROM scheduled_tasks ORDER BY created_at DESC')
-    .all() as ScheduledTask[];
+    .all() as unknown as ScheduledTask[];
 }
 
 export function updateTask(
@@ -446,7 +464,10 @@ export function updateTask(
   >,
 ): void {
   const fields: string[] = [];
-  const values: unknown[] = [];
+  // Narrow to SQLInputValue-compatible union so the .run(...values) spread
+  // below satisfies node:sqlite's stricter parameter type (better-sqlite3
+  // accepted `unknown[]`; node:sqlite does not).
+  const values: (string | number | null)[] = [];
 
   if (updates.prompt !== undefined) {
     fields.push('prompt = ?');
@@ -497,7 +518,7 @@ export function getDueTasks(): ScheduledTask[] {
     ORDER BY next_run
   `,
     )
-    .all(now) as ScheduledTask[];
+    .all(now) as unknown as ScheduledTask[];
 }
 
 export function updateTaskAfterRun(

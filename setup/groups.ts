@@ -8,7 +8,7 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 
 import { STORE_DIR } from '../src/config.js';
 import { logger } from '../src/logger.js';
@@ -47,7 +47,7 @@ async function listGroups(limit: number): Promise<void> {
     process.exit(1);
   }
 
-  const db = new Database(dbPath, { readonly: true });
+  const db = new DatabaseSync(dbPath, { readOnly: true });
   const rows = db
     .prepare(
       `SELECT jid, name FROM chats
@@ -55,7 +55,7 @@ async function listGroups(limit: number): Promise<void> {
      ORDER BY last_message_time DESC
      LIMIT ?`,
     )
-    .all(limit) as Array<{ jid: string; name: string }>;
+    .all(limit) as unknown as Array<{ jid: string; name: string }>;
   db.close();
 
   for (const row of rows) {
@@ -115,7 +115,7 @@ import makeWASocket, { useMultiFileAuthState, makeCacheableSignalKeyStore, Brows
 import pino from 'pino';
 import path from 'path';
 import fs from 'fs';
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 
 const logger = pino({ level: 'silent' });
 const authDir = path.join('store', 'auth');
@@ -126,7 +126,7 @@ if (!fs.existsSync(authDir)) {
   process.exit(1);
 }
 
-const db = new Database(dbPath);
+const db = new DatabaseSync(dbPath);
 db.pragma('journal_mode = WAL');
 db.exec('CREATE TABLE IF NOT EXISTS chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TEXT)');
 
@@ -197,12 +197,12 @@ sock.ev.on('connection.update', async (update) => {
     logger.error({ err }, 'Sync failed');
   }
 
-  // Count groups in DB using better-sqlite3 (no sqlite3 CLI)
+  // Count groups in DB using node:sqlite (no sqlite3 CLI)
   let groupsInDb = 0;
   const dbPath = path.join(STORE_DIR, 'messages.db');
   if (fs.existsSync(dbPath)) {
     try {
-      const db = new Database(dbPath, { readonly: true });
+      const db = new DatabaseSync(dbPath, { readOnly: true });
       const row = db
         .prepare(
           "SELECT COUNT(*) as count FROM chats WHERE jid LIKE '%@g.us' AND jid <> '__group_sync__'",

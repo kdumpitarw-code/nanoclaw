@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, describe, it, expect, beforeEach } from 'vitest';
 
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 
 /**
  * Tests for the register step.
@@ -12,8 +12,8 @@ import Database from 'better-sqlite3';
  * apostrophe in names, .env updates, CLAUDE.md template copy.
  */
 
-function createTestDb(): Database.Database {
-  const db = new Database(':memory:');
+function createTestDb(): DatabaseSync {
+  const db = new DatabaseSync(':memory:');
   db.exec(`CREATE TABLE IF NOT EXISTS registered_groups (
     jid TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -28,7 +28,7 @@ function createTestDb(): Database.Database {
 }
 
 describe('parameterized SQL registration', () => {
-  let db: Database.Database;
+  let db: DatabaseSync;
 
   beforeEach(() => {
     db = createTestDb();

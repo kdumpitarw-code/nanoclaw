@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
 
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 
 /**
  * Tests for the environment check step.
@@ -18,10 +18,10 @@ describe('environment detection', () => {
 });
 
 describe('registered groups DB query', () => {
-  let db: Database.Database;
+  let db: DatabaseSync;
 
   beforeEach(() => {
-    db = new Database(':memory:');
+    db = new DatabaseSync(':memory:');
     db.exec(`CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
