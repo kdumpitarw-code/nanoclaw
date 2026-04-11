@@ -472,7 +472,9 @@ function loadCanonicalConfigs(): Record<string, NanoClawAgentConfig> {
 
     log(
       `Loaded canonical configs for ${Object.keys(configs).length} agents${
-        skipped.length > 0 ? ` (skipped ${skipped.length}: ${skipped.join(', ')})` : ''
+        skipped.length > 0
+          ? ` (skipped ${skipped.length}: ${skipped.join(', ')})`
+          : ''
       }`,
     );
     return configs;
