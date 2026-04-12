@@ -1555,6 +1555,69 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         return;
       }
 
+      // Bug #14: checkpoint dispatch exited without checkpoint_complete
+      // firing. The agent made tool calls (otherwise degenerateExit would
+      // have caught it above) but never called the terminal
+      // checkpoint_complete tool that commits the worktree and marks the
+      // stage_checkpoints row done. Reporting this as success would cause
+      // the hub observer to auto-advance mission_pipeline while
+      // stage_checkpoints.{stage}/{idx} is still in_progress — the exact
+      // "pipeline advanced past an unfinished checkpoint" shape the
+      // 2026-04-11 handoff flagged and the 2026-04-12 e2e run caught live
+      // (mission 021c95c9-6461-4ccb-a867-bd74d1f0706c: all four dev_build
+      // checkpoints stayed in_progress/pending while mission_pipeline
+      // advanced through deploy → docs_update → complete with zero
+      // commits in the worktree).
+      //
+      // The fix post-conditions the checkpointCompleted flag from
+      // runAgentLoop: that flag is only set when the intercepted
+      // checkpoint_complete handler fires, commits the worktree, and
+      // sets the exit flag. Any other exit path on a checkpoint dispatch
+      // is incomplete work and should not advance the pipeline. The
+      // intercepted handler's success case already posts results inline,
+      // so this branch only runs when the agent failed to finish the
+      // checkpoint contract.
+      if (checkpointContext && !result.checkpointCompleted) {
+        const contentPreview = result.content.slice(0, 500);
+        await postResults(resultsUrl, resultsAuth, {
+          missionId,
+          pipelineStage,
+          status: 'error',
+          errorCode: 'checkpoint_not_completed',
+          errorMessage:
+            `Agent exited after ${duration}ms without calling checkpoint_complete ` +
+            `for ${pipelineStage}/${checkpointContext.checkpointIndex}. ` +
+            `Model=${result.model} (${llmPath}). The agent made tool calls ` +
+            `but never finished the checkpoint contract — the worktree was ` +
+            `not committed and the stage_checkpoints row remains in_progress. ` +
+            `The developer/devops prompt likely needs to require ` +
+            `checkpoint_complete as the terminal tool call. ` +
+            `Raw content: ${contentPreview}`,
+          modelUsed: result.model,
+          llmPath,
+          auditEntries: [
+            {
+              agentName: agent,
+              actionType: 'agent_error',
+              actionDetail:
+                `Checkpoint incomplete: ${pipelineStage}/${checkpointContext.checkpointIndex} ` +
+                `— agent exited without calling checkpoint_complete`,
+              target: 'builder-pipeline',
+              result: 'failed',
+              metadata: {
+                tokensUsed: result.tokensUsed,
+                model: result.model,
+                llmPath,
+                duration,
+                checkpointIndex: checkpointContext.checkpointIndex,
+                rawContentPreview: contentPreview,
+              },
+            },
+          ],
+        });
+        return;
+      }
+
       // Build result payload
       const resultPayload: Record<string, unknown> = {
         missionId,
