@@ -260,6 +260,17 @@ interface AgentRunRequest {
   cloud?: { forceCloud: boolean; fallbackModel: string; apiKey: string };
   /** Present iff this dispatch is a single-checkpoint run (v2). */
   checkpointContext?: CheckpointContext;
+  /**
+   * Pipeline dispatches set this to reject degenerate exits where the LLM
+   * returns prose with no tool calls on the first round. When set, the loop
+   * will nudge once (inject a corrective user message) before giving up.
+   * If the nudged round still produces no tool calls, the response is
+   * flagged `degenerateExit: true` so the caller can report a failure
+   * instead of silently marking the stage as success. See bug #12 in the
+   * 2026-04-11 Task 21 handoff — qwen2.5-coder:7b-instruct does not emit
+   * OpenAI-style tool_calls, causing dev_build/deploy to sleepwalk.
+   */
+  requireToolCallBeforeExit?: boolean;
 }
 
 interface AgentRunResponse {
@@ -274,6 +285,13 @@ interface AgentRunResponse {
    * normal post-loop results callback must be skipped to avoid duplicates.
    */
   checkpointCompleted?: boolean;
+  /**
+   * Set to `true` when the loop exited without the agent ever calling a
+   * tool on a `requireToolCallBeforeExit` dispatch (after the nudge
+   * retry). The caller should post an error result back to the hub, not
+   * a success, so the pipeline does not auto-advance on empty work.
+   */
+  degenerateExit?: boolean;
 }
 
 interface ChatMessage {
@@ -920,6 +938,13 @@ async function runAgentLoop(
   const startTime = Date.now();
   let totalTokens = 0;
   let lastResolvedModel = resolveModel(req.model);
+  // Degenerate-exit tracking (bug #12): pipeline dispatches must produce at
+  // least one tool call to be considered valid work. We track the running
+  // count and the nudge attempts so an LLM that accidentally fails on round 1
+  // gets one corrective retry before we hard-fail.
+  let toolCallsSeen = 0;
+  let nudgesUsed = 0;
+  const MAX_NUDGES = 1;
 
   // Clear any stale exit flag for this checkpoint on entry — defensive against
   // a prior aborted dispatch leaving its flag behind.
@@ -990,8 +1015,42 @@ async function runAgentLoop(
     }
     messages.push(assistantMsg);
 
-    // If no tool calls, we're done
+    // If no tool calls, either exit cleanly or nudge/fail depending on mode.
     if (!choice.message.tool_calls?.length) {
+      // Pipeline-dispatch mode: require at least one tool call before we
+      // treat this run as real work. If the agent hasn't called any tool
+      // yet, give it one corrective nudge before giving up. See bug #12.
+      if (req.requireToolCallBeforeExit && toolCallsSeen === 0) {
+        if (nudgesUsed < MAX_NUDGES) {
+          nudgesUsed += 1;
+          log(
+            `Degenerate exit (no tool calls, round ${round + 1}) — nudging agent (attempt ${nudgesUsed}/${MAX_NUDGES})`,
+          );
+          messages.push({
+            role: 'user',
+            content:
+              'Your previous response did not call any tools. This task requires you to use the tools provided — emitting prose alone is not sufficient. Review the tool list and choose the appropriate tool(s) for your role, then call them. Do not respond with prose only again.',
+          });
+          continue;
+        }
+        // Nudge budget exhausted — the model is genuinely not producing
+        // tool calls. Return with degenerateExit so the caller can post an
+        // error instead of marking the stage as success. Include the raw
+        // content (truncated) so downstream diagnostics can see what the
+        // model said.
+        const rawContent = choice.message.content ?? '';
+        log(
+          `Degenerate exit confirmed after ${round + 1} rounds (no tool calls, nudge exhausted): ${rawContent.slice(0, 200)}`,
+        );
+        return {
+          content: rawContent,
+          model: completion.model ?? req.model,
+          tokensUsed: totalTokens,
+          duration: Date.now() - startTime,
+          degenerateExit: true,
+        };
+      }
+
       log(`Agent complete after ${round + 1} rounds`);
       return {
         content: choice.message.content ?? '',
@@ -1000,6 +1059,8 @@ async function runAgentLoop(
         duration: Date.now() - startTime,
       };
     }
+
+    toolCallsSeen += choice.message.tool_calls.length;
 
     // Execute each tool call
     for (const toolCall of choice.message.tool_calls) {
@@ -1420,6 +1481,7 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
             tool_callback_url: `http://127.0.0.1:${actualPort}/tool-callback`,
             cloud,
             checkpointContext,
+            requireToolCallBeforeExit: true,
           },
           agentConfig.maxToolRounds,
         );
@@ -1439,6 +1501,7 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
             },
             tool_callback_url: `http://127.0.0.1:${actualPort}/tool-callback`,
             cloud,
+            requireToolCallBeforeExit: true,
           },
           agentConfig.maxToolRounds,
         );
@@ -1452,6 +1515,45 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         : cloud && result.model === cloud.fallbackModel
           ? 'openrouter-fallback'
           : 'portkey-local';
+
+      // Bug #12: the agent exited without ever calling a tool. That's a
+      // failed run, not a no-op success. Post an error so the hub observer
+      // does not auto-advance the stage, and bail out of the normal
+      // success path (including HitL proposal construction, which would
+      // try to parse empty content).
+      if (result.degenerateExit) {
+        const contentPreview = result.content.slice(0, 500);
+        await postResults(resultsUrl, resultsAuth, {
+          missionId,
+          pipelineStage,
+          status: 'error',
+          errorCode: 'degenerate_exit',
+          errorMessage:
+            `Agent exited after ${duration}ms without calling any tools. ` +
+            `Model=${result.model} (${llmPath}). This usually means the ` +
+            `selected model does not emit OpenAI-style tool_calls — check ` +
+            `model routing for this stage. Raw content: ${contentPreview}`,
+          modelUsed: result.model,
+          llmPath,
+          auditEntries: [
+            {
+              agentName: agent,
+              actionType: 'agent_error',
+              actionDetail: `Degenerate exit: no tool calls after nudge (model=${result.model})`,
+              target: 'builder-pipeline',
+              result: 'failed',
+              metadata: {
+                tokensUsed: result.tokensUsed,
+                model: result.model,
+                llmPath,
+                duration,
+                rawContentPreview: contentPreview,
+              },
+            },
+          ],
+        });
+        return;
+      }
 
       // Build result payload
       const resultPayload: Record<string, unknown> = {
