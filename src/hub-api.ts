@@ -359,8 +359,8 @@ interface AsyncAgentRequest {
    */
   checkpointIndex?: number;
   worktreePath?: string;
-  /** Enriched task description from the one-shot orchestrator handoff. Injected as user_message for non-checkpoint dispatches. */
-  enrichedPrompt?: string;
+  /** Prior stage handoff payloads (raw JSON strings) from the resilience harness. Injected as system prompt context for non-checkpoint dispatches. */
+  priorHandoffs?: string[];
 }
 
 // --- Agent configs: canonical source is packages/agents/canonical-configs.json ---
@@ -1345,9 +1345,8 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
     const promptPath =
       agentConfig.promptByStage?.[pipelineStage] ?? agentConfig.prompt;
     let systemPrompt = loadAgentPrompt(promptPath);
-    if (req.language && req.language !== 'English') {
-      systemPrompt += `\n\nAlways respond in ${req.language}. Do not switch languages unless the user explicitly asks.`;
-    }
+    const lang = req.language || 'English';
+    systemPrompt += `\n\nAlways respond in ${lang}. Do not switch languages unless the user explicitly asks.`;
     // `checkpoint-complete` is an intercepted tool that only makes sense on
     // checkpoint-decomposed dispatches (dev_build/deploy segmented into
     // sub-steps). Exposing it on non-checkpoint dispatches causes the LLM to
@@ -1417,6 +1416,7 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         'alacrity_hub',
       ),
       resolvedModel: req.resolvedModel ?? null,
+      stage: pipelineStage,
     };
     const toolHandlers = createToolHandlers(toolDeps);
 
@@ -1538,12 +1538,27 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
           agentConfig.maxToolRounds,
         );
       } else {
-        // Standard agent loop (no checkpoints)
-        const effectiveUserMessage = req.enrichedPrompt ?? JSON.stringify({ missionId });
-        // Prepend task to system prompt for local models that may not read user_message first
-        const effectiveSystemPrompt = req.enrichedPrompt
-          ? `${systemPrompt}\n\n## Your Task\n\n${req.enrichedPrompt}`
-          : systemPrompt;
+        // Standard agent loop (no checkpoints).
+        // Inject priorHandoffs from the resilience harness as prior stage context —
+        // the same channel builder checkpoint stages use, so the agent receives
+        // the orchestrator's routing decision without a custom side-channel.
+        let effectiveSystemPrompt = systemPrompt;
+        if (req.priorHandoffs && req.priorHandoffs.length > 0) {
+          const handoffContext = req.priorHandoffs
+            .map((h, i) => {
+              try {
+                const parsed = JSON.parse(h);
+                // Surface enrichedPrompt at top level for readability
+                const task = parsed.enrichedPrompt ? `**Task:** ${parsed.enrichedPrompt}\n\n` : '';
+                return `### Prior Stage Output ${i + 1}\n\n${task}\`\`\`json\n${JSON.stringify(parsed, null, 2)}\n\`\`\``;
+              } catch {
+                return `### Prior Stage Output ${i + 1}\n\n${h}`;
+              }
+            })
+            .join('\n\n');
+          effectiveSystemPrompt = `${systemPrompt}\n\n## Prior Stage Context\n\n${handoffContext}`;
+        }
+        const effectiveUserMessage = JSON.stringify({ missionId });
         result = await runAgentLoop(
           {
             model: effectiveVirtualKey,
@@ -1679,6 +1694,7 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
       const resultPayload: Record<string, unknown> = {
         missionId,
         pipelineStage,
+        agent,
         status: 'success',
         modelUsed: result.model,
         llmPath,
@@ -2158,7 +2174,7 @@ const server = createServer(async (req, res) => {
             resolvedModel: resolvedModel || undefined,
             checkpointIndex: resolvedCheckpointIndex,
             worktreePath: resolvedWorktreePath,
-            enrichedPrompt: metadata?.enrichedPrompt as string | undefined,
+            priorHandoffs: metadata?.priorHandoffs as string[] | undefined,
           });
         } catch (err) {
           log(`Async agent error for ${agent}/${missionId}: ${err}`);
