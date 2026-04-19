@@ -215,6 +215,14 @@ function resolveModel(modelKeyOrName: string): string {
   return VIRTUAL_KEY_MODELS[modelKeyOrName] ?? modelKeyOrName;
 }
 
+// Inverse of VIRTUAL_KEY_MODELS: given a concrete model name, return the
+// virtual key that routes to it. Falls back to `fallback` when the model
+// name is not listed (e.g. cloud model strings passed via resolvedModel).
+function resolveVirtualKey(modelName: string, fallback: string): string {
+  const entry = Object.entries(VIRTUAL_KEY_MODELS).find(([, m]) => m === modelName);
+  return entry ? entry[0] : fallback;
+}
+
 // --- Types ---
 
 interface PortkeyConfig {
@@ -243,7 +251,7 @@ interface CheckpointContext {
   missionId: string;
   stage: string;
   checkpointIndex: number;
-  worktreePath: string;
+  worktreePath?: string; // undefined for non-worktree stages (e.g. 'orchestrate')
   resultsUrl: string;
   resultsAuth: string;
 }
@@ -837,28 +845,30 @@ async function handleCheckpointComplete(
       ? (params.handoff as Record<string, unknown>)
       : {};
 
-  // --- 1. Commit the worktree (durability fence) ---
-  try {
-    await runGit(cp.worktreePath, ['add', '-A']);
-    const msgBody = summary.slice(0, 72) || `(no summary)`;
-    await runGit(cp.worktreePath, [
-      'commit',
-      '-m',
-      `checkpoint(${cp.stage}/${cp.checkpointIndex}): ${msgBody}`,
-      '--allow-empty',
-    ]);
-    log(`checkpoint_commit: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex}`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log(
-      `checkpoint_commit_failed: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex}: ${msg}`,
-    );
-    // Surface the error to the agent. The checkpoint row stays in_progress;
-    // the orphan scan will reclaim it on the next epoch change.
-    return JSON.stringify({
-      error: `checkpoint commit failed: ${msg}`,
-      retryable: true,
-    });
+  // --- 1. Commit the worktree (durability fence) — skip for non-worktree stages ---
+  if (cp.worktreePath) {
+    try {
+      await runGit(cp.worktreePath, ['add', '-A']);
+      const msgBody = summary.slice(0, 72) || `(no summary)`;
+      await runGit(cp.worktreePath, [
+        'commit',
+        '-m',
+        `checkpoint(${cp.stage}/${cp.checkpointIndex}): ${msgBody}`,
+        '--allow-empty',
+      ]);
+      log(`checkpoint_commit: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(
+        `checkpoint_commit_failed: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex}: ${msg}`,
+      );
+      // Surface the error to the agent. The checkpoint row stays in_progress;
+      // the orphan scan will reclaim it on the next epoch change.
+      return JSON.stringify({
+        error: `checkpoint commit failed: ${msg}`,
+        retryable: true,
+      });
+    }
   }
 
   // --- 2. POST completion back to the hub ---
@@ -945,6 +955,8 @@ async function runAgentLoop(
   let toolCallsSeen = 0;
   let nudgesUsed = 0;
   const MAX_NUDGES = 1;
+  let checkpointNudgesUsed = 0;
+  const MAX_CHECKPOINT_NUDGES = 2;
 
   // Clear any stale exit flag for this checkpoint on entry — defensive against
   // a prior aborted dispatch leaving its flag behind.
@@ -1049,6 +1061,30 @@ async function runAgentLoop(
           duration: Date.now() - startTime,
           degenerateExit: true,
         };
+      }
+
+      // Checkpoint enforcement: if this is a checkpoint dispatch and the agent
+      // exited without calling checkpoint_complete, inject a corrective message
+      // and force another round (up to MAX_CHECKPOINT_NUDGES times).
+      if (req.checkpointContext && !shouldCheckpointExit(req.checkpointContext)) {
+        if (checkpointNudgesUsed < MAX_CHECKPOINT_NUDGES) {
+          checkpointNudgesUsed += 1;
+          const cp = req.checkpointContext;
+          log(
+            `Checkpoint exit without checkpoint_complete: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex} — nudging (attempt ${checkpointNudgesUsed}/${MAX_CHECKPOINT_NUDGES})`,
+          );
+          messages.push({
+            role: 'user',
+            content:
+              `STOP. You have not called \`checkpoint_complete\` yet. This is a checkpoint dispatch (stage=${cp.stage}, index=${cp.checkpointIndex}). ` +
+              '`checkpoint_complete` is MANDATORY as your terminal tool call — the pipeline will not advance and your work will be discarded if you exit without it. ' +
+              'Call `checkpoint_complete` now with the required `summary` and `handoff` fields.',
+          });
+          continue;
+        }
+        log(
+          `Checkpoint nudge budget exhausted without checkpoint_complete: ${req.checkpointContext.missionId}/${req.checkpointContext.stage}/${req.checkpointContext.checkpointIndex}`,
+        );
       }
 
       log(`Agent complete after ${round + 1} rounds`);
@@ -1258,18 +1294,17 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
   if (checkpointIndex !== undefined) {
     if (!worktreePath) {
       log(
-        `checkpoint dispatch ${missionId}/${pipelineStage}/${checkpointIndex} missing worktreePath — falling back to non-checkpoint execution`,
+        `checkpoint dispatch ${missionId}/${pipelineStage}/${checkpointIndex} — no worktreePath (non-worktree stage, git commit skipped)`,
       );
-    } else {
-      checkpointContext = {
-        missionId,
-        stage: pipelineStage,
-        checkpointIndex,
-        worktreePath,
-        resultsUrl,
-        resultsAuth,
-      };
     }
+    checkpointContext = {
+      missionId,
+      stage: pipelineStage,
+      checkpointIndex,
+      worktreePath: worktreePath || undefined,
+      resultsUrl,
+      resultsAuth,
+    };
   }
 
   const agentConfig = AGENT_CONFIGS[agent];
@@ -1451,6 +1486,14 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
           : undefined;
 
     try {
+      // When req.resolvedModel carries a per-stage paradigm override, derive
+      // the Portkey virtual key that routes to it. Falls back to the agent's
+      // canonical modelKey when no override is present or no mapping exists
+      // (e.g. cloud model strings that bypass Portkey entirely).
+      const effectiveVirtualKey = req.resolvedModel
+        ? resolveVirtualKey(req.resolvedModel, agentConfig.modelKey)
+        : agentConfig.modelKey;
+
       // Dispatch branch: checkpoint v2 uses the checkpoint context to thread
       // missionId/stage/checkpointIndex/worktreePath through the intercepted
       // checkpoint_complete handler. Non-checkpoint dispatches fall through
@@ -1463,7 +1506,7 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         );
         result = await runAgentLoop(
           {
-            model: agentConfig.modelKey,
+            model: effectiveVirtualKey,
             system_prompt: systemPrompt,
             user_message: JSON.stringify({
               missionId,
@@ -1476,7 +1519,7 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
             portkey: {
               base_url: PORTKEY_BASE_URL,
               api_key: PORTKEY_API_KEY,
-              virtual_key: agentConfig.modelKey,
+              virtual_key: effectiveVirtualKey,
             },
             tool_callback_url: `http://127.0.0.1:${actualPort}/tool-callback`,
             cloud,
@@ -1489,7 +1532,7 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         // Standard agent loop (no checkpoints)
         result = await runAgentLoop(
           {
-            model: agentConfig.modelKey,
+            model: effectiveVirtualKey,
             system_prompt: systemPrompt,
             user_message: JSON.stringify({ missionId }),
             tools,
@@ -1497,7 +1540,7 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
             portkey: {
               base_url: PORTKEY_BASE_URL,
               api_key: PORTKEY_API_KEY,
-              virtual_key: agentConfig.modelKey,
+              virtual_key: effectiveVirtualKey,
             },
             tool_callback_url: `http://127.0.0.1:${actualPort}/tool-callback`,
             cloud,
