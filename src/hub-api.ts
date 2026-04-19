@@ -219,7 +219,9 @@ function resolveModel(modelKeyOrName: string): string {
 // virtual key that routes to it. Falls back to `fallback` when the model
 // name is not listed (e.g. cloud model strings passed via resolvedModel).
 function resolveVirtualKey(modelName: string, fallback: string): string {
-  const entry = Object.entries(VIRTUAL_KEY_MODELS).find(([, m]) => m === modelName);
+  const entry = Object.entries(VIRTUAL_KEY_MODELS).find(
+    ([, m]) => m === modelName,
+  );
   return entry ? entry[0] : fallback;
 }
 
@@ -357,6 +359,8 @@ interface AsyncAgentRequest {
    */
   checkpointIndex?: number;
   worktreePath?: string;
+  /** Enriched task description from the one-shot orchestrator handoff. Injected as user_message for non-checkpoint dispatches. */
+  enrichedPrompt?: string;
 }
 
 // --- Agent configs: canonical source is packages/agents/canonical-configs.json ---
@@ -856,7 +860,9 @@ async function handleCheckpointComplete(
         `checkpoint(${cp.stage}/${cp.checkpointIndex}): ${msgBody}`,
         '--allow-empty',
       ]);
-      log(`checkpoint_commit: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex}`);
+      log(
+        `checkpoint_commit: ${cp.missionId}/${cp.stage}/${cp.checkpointIndex}`,
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log(
@@ -1066,7 +1072,10 @@ async function runAgentLoop(
       // Checkpoint enforcement: if this is a checkpoint dispatch and the agent
       // exited without calling checkpoint_complete, inject a corrective message
       // and force another round (up to MAX_CHECKPOINT_NUDGES times).
-      if (req.checkpointContext && !shouldCheckpointExit(req.checkpointContext)) {
+      if (
+        req.checkpointContext &&
+        !shouldCheckpointExit(req.checkpointContext)
+      ) {
         if (checkpointNudgesUsed < MAX_CHECKPOINT_NUDGES) {
           checkpointNudgesUsed += 1;
           const cp = req.checkpointContext;
@@ -1534,7 +1543,7 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
           {
             model: effectiveVirtualKey,
             system_prompt: systemPrompt,
-            user_message: JSON.stringify({ missionId }),
+            user_message: req.enrichedPrompt ?? JSON.stringify({ missionId }),
             tools,
             max_tokens: agentConfig.maxTokens,
             portkey: {
@@ -1668,6 +1677,8 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         status: 'success',
         modelUsed: result.model,
         llmPath,
+        // Include agent output for hub-side artifact creation (one-shot review gate)
+        outputContent: result.content ?? null,
         auditEntries: [
           {
             agentName: agent,
@@ -2142,6 +2153,7 @@ const server = createServer(async (req, res) => {
             resolvedModel: resolvedModel || undefined,
             checkpointIndex: resolvedCheckpointIndex,
             worktreePath: resolvedWorktreePath,
+            enrichedPrompt: metadata?.enrichedPrompt as string | undefined,
           });
         } catch (err) {
           log(`Async agent error for ${agent}/${missionId}: ${err}`);
