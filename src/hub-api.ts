@@ -1539,11 +1539,16 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         );
       } else {
         // Standard agent loop (no checkpoints)
+        const effectiveUserMessage = req.enrichedPrompt ?? JSON.stringify({ missionId });
+        // Prepend task to system prompt for local models that may not read user_message first
+        const effectiveSystemPrompt = req.enrichedPrompt
+          ? `${systemPrompt}\n\n## Your Task\n\n${req.enrichedPrompt}`
+          : systemPrompt;
         result = await runAgentLoop(
           {
             model: effectiveVirtualKey,
-            system_prompt: systemPrompt,
-            user_message: req.enrichedPrompt ?? JSON.stringify({ missionId }),
+            system_prompt: effectiveSystemPrompt,
+            user_message: effectiveUserMessage,
             tools,
             max_tokens: agentConfig.maxTokens,
             portkey: {
