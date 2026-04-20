@@ -1417,6 +1417,8 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
       ),
       resolvedModel: req.resolvedModel ?? null,
       stage: pipelineStage,
+      queryVaultGraph,
+      invalidateVaultCache,
     };
     const toolHandlers = createToolHandlers(toolDeps);
 
@@ -1549,7 +1551,9 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
               try {
                 const parsed = JSON.parse(h);
                 // Surface enrichedPrompt at top level for readability
-                const task = parsed.enrichedPrompt ? `**Task:** ${parsed.enrichedPrompt}\n\n` : '';
+                const task = parsed.enrichedPrompt
+                  ? `**Task:** ${parsed.enrichedPrompt}\n\n`
+                  : '';
                 return `### Prior Stage Output ${i + 1}\n\n${task}\`\`\`json\n${JSON.stringify(parsed, null, 2)}\n\`\`\``;
               } catch {
                 return `### Prior Stage Output ${i + 1}\n\n${h}`;
