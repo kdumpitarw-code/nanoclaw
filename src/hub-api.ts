@@ -3461,14 +3461,17 @@ const server = createServer(async (req, res) => {
       if (request.gate === 'plan') {
         if (!request.content) {
           jsonResponse(res, 400, {
-            error: 'Missing required field: content (plan document text including ## Impact section)',
+            error:
+              'Missing required field: content (plan document text including ## Impact section)',
           });
           return;
         }
 
         const impact = validateImpactSection(request.content);
-        const requiresAck = impact.severity === 'medium' || impact.severity === 'high';
-        const acknowledged = !requiresAck || /^\s*Reviewed\.\s*$/m.test(request.content);
+        const requiresAck =
+          impact.severity === 'medium' || impact.severity === 'high';
+        const acknowledged =
+          !requiresAck || /^\s*Reviewed\.\s*$/m.test(request.content);
         const passed = impact.valid && acknowledged;
 
         log(
