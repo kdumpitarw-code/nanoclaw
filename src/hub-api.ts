@@ -48,6 +48,7 @@ import {
   extractAssessmentBlock,
   validatePreEditConfirmation,
   validateShipAudit,
+  validateImpactSection,
   type ShipAuditState,
   type GitState,
 } from '@alacrity/tools/validation';
@@ -155,10 +156,18 @@ const ALACRITY_HUB_ROOT = join(
 // Mtime-cached graphs for /api/tools/impact. Invalidated when root package.json mtime changes
 // or when caller passes refresh=true. Other tool endpoints rebuild on every call; impact gets
 // caching because it builds both graphs and is expected to be called per-file from pre-commit.
-let cachedImportGraph: { graph: ImportGraph; mtime: number; root: string } | null = null;
-let cachedDocGraph: { graph: DocGraph; mtime: number; root: string } | null = null;
+let cachedImportGraph: {
+  graph: ImportGraph;
+  mtime: number;
+  root: string;
+} | null = null;
+let cachedDocGraph: { graph: DocGraph; mtime: number; root: string } | null =
+  null;
 
-function getCachedImportGraph(repoRoot: string, forceRefresh: boolean): ImportGraph {
+function getCachedImportGraph(
+  repoRoot: string,
+  forceRefresh: boolean,
+): ImportGraph {
   const mtime = statSync(join(repoRoot, 'package.json')).mtimeMs;
   if (
     !forceRefresh &&
@@ -3415,7 +3424,7 @@ const server = createServer(async (req, res) => {
     try {
       const body = await readBody(req);
       const request = JSON.parse(body) as {
-        gate: 'assess' | 'pre-edit' | 'ship';
+        gate: 'assess' | 'plan' | 'pre-edit' | 'ship';
         content?: string;
         targetFile?: string;
         auditState?: ShipAuditState;
@@ -3449,6 +3458,36 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      if (request.gate === 'plan') {
+        if (!request.content) {
+          jsonResponse(res, 400, {
+            error: 'Missing required field: content (plan document text including ## Impact section)',
+          });
+          return;
+        }
+
+        const impact = validateImpactSection(request.content);
+        const requiresAck = impact.severity === 'medium' || impact.severity === 'high';
+        const acknowledged = !requiresAck || /^\s*Reviewed\.\s*$/m.test(request.content);
+        const passed = impact.valid && acknowledged;
+
+        log(
+          `validate/plan: ${passed ? 'PASSED' : 'FAILED'} severity=${impact.severity ?? 'unknown'} missing=${impact.missingFields.join(',')} ack=${acknowledged}`,
+        );
+        jsonResponse(res, passed ? 200 : 422, {
+          gate: 'plan',
+          valid: passed,
+          impact,
+          acknowledged,
+          reason: !impact.valid
+            ? `Impact section invalid: ${impact.missingFields.join(', ')}`
+            : !acknowledged
+              ? `Severity ${impact.severity} requires "Reviewed." acknowledgment line in plan body`
+              : null,
+        });
+        return;
+      }
+
       if (request.gate === 'pre-edit') {
         if (!request.content) {
           jsonResponse(res, 400, {
@@ -3463,12 +3502,24 @@ const server = createServer(async (req, res) => {
           request.targetFile,
         );
 
+        const enforce = process.env.IMPACT_GATE_ENFORCE === '1';
+        const impact = validateImpactSection(request.content);
+        const impactOk =
+          impact.valid &&
+          (impact.severity === 'low' ||
+            /^\s*Reviewed\.\s*$/m.test(request.content));
+        const finalValid = enforce ? result.valid && impactOk : result.valid;
+
         log(
-          `validate/pre-edit: ${result.valid ? 'PASSED' : 'FAILED'}${result.filePath ? ` (${result.filePath})` : ''} risk=${result.risk ?? 'unknown'}`,
+          `validate/pre-edit: ${finalValid ? 'PASSED' : 'FAILED'}${result.filePath ? ` (${result.filePath})` : ''} risk=${result.risk ?? 'unknown'} impactSeverity=${impact.severity ?? 'unknown'} enforced=${enforce}`,
         );
-        jsonResponse(res, 200, {
+        jsonResponse(res, finalValid ? 200 : 422, {
           gate: 'pre-edit',
           ...result,
+          valid: finalValid,
+          impact,
+          impactOk,
+          enforced: enforce,
         });
         return;
       }
@@ -3495,7 +3546,7 @@ const server = createServer(async (req, res) => {
       }
 
       jsonResponse(res, 400, {
-        error: `Unknown gate: ${request.gate}. Valid gates: assess, pre-edit, ship`,
+        error: `Unknown gate: ${request.gate}. Valid gates: assess, plan, pre-edit, ship`,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
