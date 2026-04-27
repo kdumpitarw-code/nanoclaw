@@ -18,6 +18,7 @@ import {
   readFileSync,
   readdirSync,
   unlinkSync,
+  statSync,
 } from 'fs';
 import { join, dirname } from 'path';
 import { exec } from 'child_process';
@@ -26,13 +27,16 @@ import { resolve, relative } from 'path';
 import {
   buildImportGraph,
   computeBlastRadius,
+  type ImportGraph,
 } from '@alacrity/tools/import-graph';
 import {
   buildDocGraph,
   queryDocDeps,
   computeDocImpact,
   queryDocContext,
+  type DocGraph,
 } from '@alacrity/tools/doc-graph';
+import { computeImpact } from '@alacrity/tools/impact';
 import {
   queryVaultGraph,
   getVaultStats,
@@ -147,6 +151,42 @@ const ALACRITY_HUB_ROOT = join(
   'Vibe Sphere',
   'alacrity_hub',
 );
+
+// Mtime-cached graphs for /api/tools/impact. Invalidated when root package.json mtime changes
+// or when caller passes refresh=true. Other tool endpoints rebuild on every call; impact gets
+// caching because it builds both graphs and is expected to be called per-file from pre-commit.
+let cachedImportGraph: { graph: ImportGraph; mtime: number; root: string } | null = null;
+let cachedDocGraph: { graph: DocGraph; mtime: number; root: string } | null = null;
+
+function getCachedImportGraph(repoRoot: string, forceRefresh: boolean): ImportGraph {
+  const mtime = statSync(join(repoRoot, 'package.json')).mtimeMs;
+  if (
+    !forceRefresh &&
+    cachedImportGraph &&
+    cachedImportGraph.root === repoRoot &&
+    cachedImportGraph.mtime === mtime
+  ) {
+    return cachedImportGraph.graph;
+  }
+  const graph = buildImportGraph(repoRoot);
+  cachedImportGraph = { graph, mtime, root: repoRoot };
+  return graph;
+}
+
+function getCachedDocGraph(repoRoot: string, forceRefresh: boolean): DocGraph {
+  const mtime = statSync(join(repoRoot, 'package.json')).mtimeMs;
+  if (
+    !forceRefresh &&
+    cachedDocGraph &&
+    cachedDocGraph.root === repoRoot &&
+    cachedDocGraph.mtime === mtime
+  ) {
+    return cachedDocGraph.graph;
+  }
+  const graph = buildDocGraph(repoRoot);
+  cachedDocGraph = { graph, mtime, root: repoRoot };
+  return graph;
+}
 
 // Lazy D1 adapter for session routes (not dispatched by hub, so needs its own proxy ref)
 const agentsPkgSrc = join(ALACRITY_HUB_ROOT, 'packages', 'agents', 'src');
@@ -2714,6 +2754,53 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // POST /api/tools/impact — unified blast-radius + doc-impact + severity summary
+  if (url.pathname === '/api/tools/impact' && method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const request = JSON.parse(body) as {
+        path?: string;
+        repoRoot?: string;
+        maxDepth?: number;
+        refresh?: boolean;
+      };
+
+      if (!request.path) {
+        jsonResponse(res, 400, { error: 'Missing required field: path' });
+        return;
+      }
+
+      const repoRoot = request.repoRoot ?? ALACRITY_HUB_ROOT;
+      const maxDepth = request.maxDepth ?? 5;
+      const refresh = request.refresh === true;
+
+      const importGraph = getCachedImportGraph(repoRoot, refresh);
+      const docGraph = getCachedDocGraph(repoRoot, refresh);
+
+      // computeBlastRadius/computeDocImpact key graphs by absolute path
+      const absPath = resolve(repoRoot, request.path);
+
+      const result = computeImpact({
+        path: absPath,
+        importGraph,
+        docGraph,
+        basePath: repoRoot,
+        maxDepth,
+      });
+
+      log(
+        `tools/impact: ${request.path} severity=${result.summary.severity} code=${result.summary.totalCodeDependents} docs=${result.summary.totalDocDependents}`,
+      );
+      jsonResponse(res, 200, { ...result, path: request.path });
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`tools/impact error: ${message}`);
+      jsonResponse(res, 500, { error: message });
+      return;
+    }
+  }
+
   // POST /api/tools/vault-query — search vault notes
   if (url.pathname === '/api/tools/vault-query' && method === 'POST') {
     try {
@@ -3476,6 +3563,7 @@ server.listen(PORT, HOST, () => {
   log(`Doc-deps:     POST /api/tools/doc-deps`);
   log(`Doc-impact:   POST /api/tools/doc-impact`);
   log(`Doc-context:  POST /api/tools/doc-context`);
+  log(`Impact:       POST /api/tools/impact`);
   log(`Vault-query:  POST /api/tools/vault-query`);
   log(`Vault-stats:  GET  /api/tools/vault-stats`);
   log(`Vault-refresh:POST /api/tools/vault-refresh`);
