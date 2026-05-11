@@ -1560,20 +1560,26 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
       // to a plain agent loop. (The legacy fetchCheckpoints/runCheckpointAware
       // path was removed in Task 17 — see git log.)
       let result: AgentRunResponse;
+      // Track the prompts actually sent to the LLM so we can include them in
+      // the results POST for codeact-shadow-daemon replay (Phase 1.5 Task 15).
+      let loopSystemPrompt: string;
+      let loopUserMessage: string;
       if (checkpointContext) {
         log(
           `Checkpoint v2 dispatch: ${missionId}/${pipelineStage}/${checkpointContext.checkpointIndex} (worktree=${worktreePath})`,
         );
+        loopSystemPrompt = systemPrompt;
+        loopUserMessage = JSON.stringify({
+          missionId,
+          stage: pipelineStage,
+          checkpointIndex: checkpointContext.checkpointIndex,
+          worktreePath,
+        });
         result = await runAgentLoop(
           {
             model: effectiveVirtualKey,
-            system_prompt: systemPrompt,
-            user_message: JSON.stringify({
-              missionId,
-              stage: pipelineStage,
-              checkpointIndex: checkpointContext.checkpointIndex,
-              worktreePath,
-            }),
+            system_prompt: loopSystemPrompt,
+            user_message: loopUserMessage,
             tools,
             max_tokens: agentConfig.maxTokens,
             portkey: {
@@ -1611,12 +1617,13 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
             .join('\n\n');
           effectiveSystemPrompt = `${systemPrompt}\n\n## Prior Stage Context\n\n${handoffContext}`;
         }
-        const effectiveUserMessage = JSON.stringify({ missionId });
+        loopSystemPrompt = effectiveSystemPrompt;
+        loopUserMessage = JSON.stringify({ missionId });
         result = await runAgentLoop(
           {
             model: effectiveVirtualKey,
-            system_prompt: effectiveSystemPrompt,
-            user_message: effectiveUserMessage,
+            system_prompt: loopSystemPrompt,
+            user_message: loopUserMessage,
             tools,
             max_tokens: agentConfig.maxTokens,
             portkey: {
@@ -1753,6 +1760,11 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         llmPath,
         // Include agent output for hub-side artifact creation (one-shot review gate)
         outputContent: result.content ?? null,
+        // Effective prompts sent to the LLM — used by codeact-shadow-daemon
+        // (Phase 1.5) to replay this stage through the CodeAct kernel for
+        // shadow validation. Defaults to empty string on the Worker side if absent.
+        effective_system_prompt: loopSystemPrompt,
+        effective_user_prompt: loopUserMessage,
         auditEntries: [
           {
             agentName: agent,
