@@ -336,6 +336,12 @@ interface AgentRunResponse {
   content: string;
   model: string;
   tokensUsed: number;
+  /** Prompt tokens summed across all rounds (when the LLM provider reports usage). */
+  tokensIn: number;
+  /** Completion tokens summed across all rounds (when the LLM provider reports usage). */
+  tokensOut: number;
+  /** Tool calls emitted by the agent across all rounds. */
+  toolCallCount: number;
   duration: number;
   /**
    * Set to `true` by runAgentLoop when the loop exited because the agent
@@ -1002,6 +1008,8 @@ async function runAgentLoop(
   const maxRounds = maxToolRounds ?? MAX_TOOL_ROUNDS;
   const startTime = Date.now();
   let totalTokens = 0;
+  let totalTokensIn = 0;
+  let totalTokensOut = 0;
   let lastResolvedModel = resolveModel(req.model);
   // Degenerate-exit tracking (bug #12): pipeline dispatches must produce at
   // least one tool call to be considered valid work. We track the running
@@ -1041,6 +1049,9 @@ async function runAgentLoop(
         content: lastAssistant?.content ?? 'Checkpoint complete.',
         model: lastResolvedModel,
         tokensUsed: totalTokens,
+        tokensIn: totalTokensIn,
+        tokensOut: totalTokensOut,
+        toolCallCount: toolCallsSeen,
         duration: Date.now() - startTime,
         checkpointCompleted: true,
       };
@@ -1063,6 +1074,8 @@ async function runAgentLoop(
 
     if (completion.usage) {
       totalTokens += completion.usage.total_tokens;
+      totalTokensIn += completion.usage.prompt_tokens;
+      totalTokensOut += completion.usage.completion_tokens;
     }
     if (completion.model) {
       lastResolvedModel = completion.model;
@@ -1113,6 +1126,9 @@ async function runAgentLoop(
           content: rawContent,
           model: completion.model ?? req.model,
           tokensUsed: totalTokens,
+          tokensIn: totalTokensIn,
+          tokensOut: totalTokensOut,
+          toolCallCount: toolCallsSeen,
           duration: Date.now() - startTime,
           degenerateExit: true,
         };
@@ -1150,6 +1166,9 @@ async function runAgentLoop(
         content: choice.message.content ?? '',
         model: completion.model ?? req.model,
         tokensUsed: totalTokens,
+        tokensIn: totalTokensIn,
+        tokensOut: totalTokensOut,
+        toolCallCount: toolCallsSeen,
         duration: Date.now() - startTime,
       };
     }
@@ -1204,6 +1223,9 @@ async function runAgentLoop(
     content: lastAssistant?.content ?? 'Agent reached maximum tool rounds.',
     model: req.model,
     tokensUsed: totalTokens,
+    tokensIn: totalTokensIn,
+    tokensOut: totalTokensOut,
+    toolCallCount: toolCallsSeen,
     duration: Date.now() - startTime,
   };
 }
@@ -1765,6 +1787,15 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         // shadow validation. Defaults to empty string on the Worker side if absent.
         effective_system_prompt: loopSystemPrompt,
         effective_user_prompt: loopUserMessage,
+        // Per-stage telemetry consumed by Worker /api/agent-results to write
+        // the primary agent_runs row. Phase 1 shadow comparison depends on
+        // tokensIn/tokensOut being populated so token_ratio_pass is computable.
+        metadata: {
+          tokensIn: result.tokensIn,
+          tokensOut: result.tokensOut,
+          toolCallCount: result.toolCallCount,
+          wallClockMs: duration,
+        },
         auditEntries: [
           {
             agentName: agent,
