@@ -58,6 +58,18 @@ import {
   type ArtifactState,
 } from '@alacrity/tools/lifecycle-parser';
 import { runGit } from './git-helpers.js';
+import { runAgentLoopCodeAct, type CodeActRunResult } from './codeact-runner.js';
+import type { LLMClient } from '@alacrity/codeact/runner';
+
+/**
+ * Resolve the alacrity_hub tool schema directory relative to NanoClaw's
+ * source location. Holds JSON schemas + `codeact_wrappers/` Python module.
+ * Used only by the CodeAct primary path (Phase 2).
+ */
+const ALACRITY_SCHEMA_DIR = resolve(
+  import.meta.dirname ?? __dirname,
+  '../../alacrity_hub/packages/agents/tools',
+);
 
 const execAsync = promisify(exec);
 
@@ -416,6 +428,15 @@ interface AsyncAgentRequest {
   worktreePath?: string;
   /** Prior stage handoff payloads (raw JSON strings) from the resilience harness. Injected as system prompt context for non-checkpoint dispatches. */
   priorHandoffs?: string[];
+  /**
+   * Paradigm-resolved protocol for this stage. When 'codeact', the loop
+   * runs through `runAgentLoopCodeAct` (Python kernel + bridge) instead of
+   * the OpenAI tool_calls path. Defaults to 'tool_calls'. The env var
+   * `FORCE_TOOL_CALLS_ALL=1` short-circuits codeact back to tool_calls
+   * for emergency rollback without a code revert.
+   * Phase 2 (Track A) wiring; no paradigm currently has protocol=codeact.
+   */
+  protocol?: 'tool_calls' | 'codeact';
 }
 
 // --- Agent configs: canonical source is packages/agents/canonical-configs.json ---
@@ -1641,24 +1662,78 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         }
         loopSystemPrompt = effectiveSystemPrompt;
         loopUserMessage = JSON.stringify({ missionId });
-        result = await runAgentLoop(
-          {
-            model: effectiveVirtualKey,
-            system_prompt: loopSystemPrompt,
-            user_message: loopUserMessage,
-            tools,
-            max_tokens: agentConfig.maxTokens,
-            portkey: {
-              base_url: PORTKEY_BASE_URL,
-              api_key: PORTKEY_API_KEY,
-              virtual_key: effectiveVirtualKey,
+
+        // Phase 2 Track A: branch on req.protocol. The FORCE_TOOL_CALLS_ALL
+        // env var short-circuits codeact back to tool_calls for emergency
+        // rollback without a code revert.
+        const useCodeAct =
+          req.protocol === 'codeact' && process.env.FORCE_TOOL_CALLS_ALL !== '1';
+
+        if (useCodeAct) {
+          log(`Phase 2 CodeAct primary: ${agent}/${missionId}/${pipelineStage}`);
+          const llmAdapter: LLMClient = {
+            async complete({ messages }) {
+              const portkeyCfg = {
+                base_url: PORTKEY_BASE_URL,
+                api_key: PORTKEY_API_KEY,
+                virtual_key: effectiveVirtualKey,
+              };
+              // No tool_calls in codeact mode — pass empty tools.
+              const completion = await callLLM(
+                portkeyCfg,
+                effectiveVirtualKey,
+                messages as ChatMessage[],
+                [],
+                agentConfig.maxTokens,
+                cloud,
+              );
+              const choice = completion.choices[0];
+              return {
+                text: choice?.message?.content ?? '',
+                tokensIn: completion.usage?.prompt_tokens ?? 0,
+                tokensOut: completion.usage?.completion_tokens ?? 0,
+              };
             },
-            tool_callback_url: `http://127.0.0.1:${actualPort}/tool-callback`,
-            cloud,
-            requireToolCallBeforeExit: true,
-          },
-          agentConfig.maxToolRounds,
-        );
+          };
+          const codeactResult: CodeActRunResult = await runAgentLoopCodeAct({
+            systemPrompt: loopSystemPrompt,
+            userMessage: loopUserMessage,
+            schemaDir: ALACRITY_SCHEMA_DIR,
+            toolCallbackUrl: `http://127.0.0.1:${actualPort}/tool-callback`,
+            llm: llmAdapter,
+          });
+          // Map CodeActRunResult → AgentRunResponse shape so the rest of
+          // runAsyncAgent (postResults, audit entries) is unchanged.
+          result = {
+            content: codeactResult.content,
+            model: effectiveVirtualKey,
+            tokensUsed: codeactResult.tokensIn + codeactResult.tokensOut,
+            tokensIn: codeactResult.tokensIn,
+            tokensOut: codeactResult.tokensOut,
+            toolCallCount: codeactResult.toolCallCount,
+            duration: codeactResult.duration,
+            degenerateExit: !codeactResult.ok,
+          };
+        } else {
+          result = await runAgentLoop(
+            {
+              model: effectiveVirtualKey,
+              system_prompt: loopSystemPrompt,
+              user_message: loopUserMessage,
+              tools,
+              max_tokens: agentConfig.maxTokens,
+              portkey: {
+                base_url: PORTKEY_BASE_URL,
+                api_key: PORTKEY_API_KEY,
+                virtual_key: effectiveVirtualKey,
+              },
+              tool_callback_url: `http://127.0.0.1:${actualPort}/tool-callback`,
+              cloud,
+              requireToolCallBeforeExit: true,
+            },
+            agentConfig.maxToolRounds,
+          );
+        }
       }
 
       const duration = Date.now() - startTime;
@@ -1790,7 +1865,12 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         // Per-stage telemetry consumed by Worker /api/agent-results to write
         // the primary agent_runs row. Phase 1 shadow comparison depends on
         // tokensIn/tokensOut being populated so token_ratio_pass is computable.
+        // `protocol` (Phase 2 Track A) tells the Worker which protocol path
+        // produced this row so agent_runs.protocol matches reality.
         metadata: {
+          protocol: req.protocol === 'codeact' && process.env.FORCE_TOOL_CALLS_ALL !== '1'
+            ? 'codeact'
+            : 'tool_calls',
           tokensIn: result.tokensIn,
           tokensOut: result.tokensOut,
           toolCallCount: result.toolCallCount,
@@ -2206,6 +2286,7 @@ const server = createServer(async (req, res) => {
         checkpointIndex,
         worktreePath,
         metadata,
+        protocol,
       } = body;
 
       if (
@@ -2271,6 +2352,7 @@ const server = createServer(async (req, res) => {
             checkpointIndex: resolvedCheckpointIndex,
             worktreePath: resolvedWorktreePath,
             priorHandoffs: metadata?.priorHandoffs as string[] | undefined,
+            protocol: protocol === 'codeact' ? 'codeact' : 'tool_calls',
           });
         } catch (err) {
           log(`Async agent error for ${agent}/${missionId}: ${err}`);
