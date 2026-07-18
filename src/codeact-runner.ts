@@ -38,7 +38,9 @@ function loadAllTools(schemaDir: string): Set<string> {
   const tools = new Set<string>();
   for (const f of readdirSync(schemaDir).filter((n) => n.endsWith('.json'))) {
     try {
-      const parsed = JSON.parse(readFileSync(join(schemaDir, f), 'utf8')) as { name?: string };
+      const parsed = JSON.parse(readFileSync(join(schemaDir, f), 'utf8')) as {
+        name?: string;
+      };
       if (parsed.name) tools.add(parsed.name);
     } catch {
       // Skip unreadable / malformed schema files — defensive against ad-hoc additions.
@@ -110,12 +112,24 @@ export async function runAgentLoopCodeAct(
           });
           if (!res.ok) {
             const text = await res.text().catch(() => 'callback error');
-            return { ok: false, error: { type: 'HttpError', message: `Tool error (${res.status}): ${text}` } };
+            return {
+              ok: false,
+              error: {
+                type: 'HttpError',
+                message: `Tool error (${res.status}): ${text}`,
+              },
+            };
           }
           const body = (await res.json()) as { result: unknown };
           return { ok: true, result: body.result };
         } catch (err) {
-          return { ok: false, error: { type: 'FetchError', message: err instanceof Error ? err.message : String(err) } };
+          return {
+            ok: false,
+            error: {
+              type: 'FetchError',
+              message: err instanceof Error ? err.message : String(err),
+            },
+          };
         }
       },
     });
@@ -155,7 +169,15 @@ export async function runAgentLoopCodeAct(
       errorKind: err instanceof Error ? err.constructor.name : 'Unknown',
     };
   } finally {
-    try { if (kernel) await kernel.shutdown(); } catch { kernel?.kill(); }
-    try { if (bridge) await bridge.close(); } catch { /* ignore */ }
+    try {
+      if (kernel) await kernel.shutdown();
+    } catch {
+      kernel?.kill();
+    }
+    try {
+      if (bridge) await bridge.close();
+    } catch {
+      /* ignore */
+    }
   }
 }

@@ -5,7 +5,10 @@ import { runAgentLoopCodeAct } from './codeact-runner.js';
 import type { LLMClient } from '@alacrity/codeact/runner';
 
 // Schema dir lives in the sibling alacrity_hub workspace.
-const SCHEMA_DIR = join(import.meta.dirname, '../../alacrity_hub/packages/agents/tools');
+const SCHEMA_DIR = join(
+  import.meta.dirname,
+  '../../alacrity_hub/packages/agents/tools',
+);
 
 function stubLLM(scriptedBlocks: string[]): LLMClient {
   let i = 0;
@@ -55,7 +58,9 @@ describe('runAgentLoopCodeAct', () => {
       });
     });
     await new Promise<void>((r) => httpServer.listen(0, '127.0.0.1', r));
-    const port = (httpServer.address() as ReturnType<Server['address']> & { port: number }).port;
+    const port = (
+      httpServer.address() as ReturnType<Server['address']> & { port: number }
+    ).port;
 
     try {
       // spec-write is a known mutator tool in the schema dir.
