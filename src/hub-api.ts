@@ -11,6 +11,7 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse } from 'http';
+import { timingSafeEqual } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -58,7 +59,10 @@ import {
   type ArtifactState,
 } from '@alacrity/tools/lifecycle-parser';
 import { runGit } from './git-helpers.js';
-import { runAgentLoopCodeAct, type CodeActRunResult } from './codeact-runner.js';
+import {
+  runAgentLoopCodeAct,
+  type CodeActRunResult,
+} from './codeact-runner.js';
 import type { LLMClient } from '@alacrity/codeact/runner';
 
 /**
@@ -142,12 +146,116 @@ class AgentSemaphore {
 
 const agentSemaphore = new AgentSemaphore();
 
-// CF Access validation for cloud-first async endpoint
-const CF_ACCESS_EXPECTED_ID = process.env.CF_ACCESS_EXPECTED_ID || '';
-const CF_ACCESS_EXPECTED_SECRET = process.env.CF_ACCESS_EXPECTED_SECRET || '';
-const AGENT_RESULTS_SECRET = process.env.AGENT_RESULTS_SECRET || '';
+// CF Access validation for cloud-first async endpoint.
+//
+// Dual-read rename (migration 2026-07-18): CF_ACCESS_EXPECTED_* describes the
+// *inbound* direction — credentials this process expects an incoming caller to
+// present — so it becomes CF_ACCESS_INBOUND_*. Both names are read; the old
+// one still works.
+const CF_ACCESS_INBOUND_ID = readWithLegacyFallback(
+  'CF_ACCESS_INBOUND_ID',
+  'CF_ACCESS_EXPECTED_ID',
+);
+const CF_ACCESS_INBOUND_SECRET = readWithLegacyFallback(
+  'CF_ACCESS_INBOUND_SECRET',
+  'CF_ACCESS_EXPECTED_SECRET',
+);
+
+// The OPPOSITE direction, and deliberately separate constants: credentials
+// this process PRESENTS when calling the hub, which sits behind Access. The
+// inbound pair above cannot serve here — different credentials, different job.
+//
+// Empty is a legal state: a proxy on 127.0.0.1 needs no Access layer. The
+// adapter omits the headers when these are blank rather than sending empties.
+const CF_ACCESS_OUTBOUND_ID = process.env.CF_ACCESS_OUTBOUND_ID || '';
+const CF_ACCESS_OUTBOUND_SECRET = process.env.CF_ACCESS_OUTBOUND_SECRET || '';
+
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const HUB_D1_PROXY_URL = process.env.HUB_D1_PROXY_URL || '';
+
+// ---------------------------------------------------------------------------
+// SERVICE TOKENS — TWO DIRECTIONS, AND THEY MUST STAY SEPARATE.
+//
+// `AGENT_RESULTS_SECRET` was doing two opposite jobs through a single constant:
+//
+//   OUTBOUND — the token this process *presents* when calling the Worker
+//              (the D1 proxy in getSessionD1 below).
+//   INBOUND  — the token this process *demands* from callers hitting
+//              /api/agent/run-async, /api/worktree/create, /api/vault/*.
+//
+// Because it was one constant, "rename it to prefer SERVICE_TOKEN_NANOCLAW"
+// would have silently broken the inbound half: the hub Worker still sends the
+// legacy shared secret, so every hub -> NanoClaw call would have started
+// 403ing the moment SERVICE_TOKEN_NANOCLAW was set. That is the same class of
+// failure as the 34,144 silent 401s this migration exists to prevent.
+//
+// So the two directions are now modelled separately:
+//   - outbound picks ONE token (new preferred, legacy fallback);
+//   - inbound ACCEPTS THE SET (new and legacy simultaneously), which is what
+//     "nothing breaks at any point" actually requires.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read `preferred`, falling back to `legacy` with a one-time startup warning.
+ * Runs at module load, so each deprecation is logged once per process.
+ */
+function readWithLegacyFallback(preferred: string, legacy: string): string {
+  const value = process.env[preferred];
+  if (value) return value;
+  const fallback = process.env[legacy];
+  if (fallback) {
+    console.warn(
+      `[env] DEPRECATED: ${preferred} is unset; falling back to ${legacy}. ` +
+        `Set ${preferred} in NanoClaw/.env — ${legacy} is being retired.`,
+    );
+    return fallback;
+  }
+  return '';
+}
+
+/** Token presented on outbound calls to the hub Worker. */
+const OUTBOUND_SERVICE_TOKEN = readWithLegacyFallback(
+  'SERVICE_TOKEN_NANOCLAW',
+  'AGENT_RESULTS_SECRET',
+);
+
+/**
+ * Every token accepted from inbound callers. Both are accepted for as long as
+ * any caller still presents the legacy shared secret; dropping it is a later,
+ * deliberate step. Empty/unset values are filtered out so an unset variable can
+ * never match an empty bearer.
+ */
+const INBOUND_SERVICE_TOKENS: readonly string[] = [
+  process.env.SERVICE_TOKEN_NANOCLAW || '',
+  process.env.AGENT_RESULTS_SECRET || '',
+].filter((t) => t.length > 0);
+
+/** True when inbound bearer auth is configured at all. */
+const INBOUND_AUTH_ENABLED = INBOUND_SERVICE_TOKENS.length > 0;
+
+/**
+ * Validate an inbound `Authorization` header against the accepted token set.
+ *
+ * Compares against every configured token without short-circuiting, so the
+ * work does not depend on which token matched. Returns false when auth is
+ * enabled and the header is missing or matches nothing.
+ */
+function isAuthorizedInbound(authHeader: string | undefined): boolean {
+  if (!INBOUND_AUTH_ENABLED) return true;
+  if (!authHeader?.startsWith('Bearer ')) return false;
+  const presented = Buffer.from(authHeader.slice(7));
+  let matched = false;
+  for (const token of INBOUND_SERVICE_TOKENS) {
+    const expected = Buffer.from(token);
+    if (
+      presented.length === expected.length &&
+      timingSafeEqual(presented, expected)
+    ) {
+      matched = true;
+    }
+  }
+  return matched;
+}
 
 // Path to the agents package on this machine
 const AGENTS_BASE = join(
@@ -214,18 +322,19 @@ const agentsPkgSrc = join(ALACRITY_HUB_ROOT, 'packages', 'agents', 'src');
 let sessionD1: { prepare: (sql: string) => unknown } | null = null;
 async function getSessionD1() {
   if (sessionD1) return sessionD1;
-  if (!HUB_D1_PROXY_URL || !AGENT_RESULTS_SECRET) {
+  if (!HUB_D1_PROXY_URL || !OUTBOUND_SERVICE_TOKEN) {
     throw new Error(
-      'HUB_D1_PROXY_URL and AGENT_RESULTS_SECRET required for session routes',
+      'HUB_D1_PROXY_URL and SERVICE_TOKEN_NANOCLAW (or legacy ' +
+        'AGENT_RESULTS_SECRET) required for session routes',
     );
   }
   const { createD1ProxyAdapter } = await import(
     join(agentsPkgSrc, 'd1-proxy-adapter.ts')
   );
-  sessionD1 = createD1ProxyAdapter(
-    HUB_D1_PROXY_URL,
-    AGENT_RESULTS_SECRET,
-  ) as typeof sessionD1;
+  sessionD1 = createD1ProxyAdapter(HUB_D1_PROXY_URL, OUTBOUND_SERVICE_TOKEN, {
+    clientId: CF_ACCESS_OUTBOUND_ID,
+    clientSecret: CF_ACCESS_OUTBOUND_SECRET,
+  }) as typeof sessionD1;
   return sessionD1!;
 }
 
@@ -1667,10 +1776,13 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         // env var short-circuits codeact back to tool_calls for emergency
         // rollback without a code revert.
         const useCodeAct =
-          req.protocol === 'codeact' && process.env.FORCE_TOOL_CALLS_ALL !== '1';
+          req.protocol === 'codeact' &&
+          process.env.FORCE_TOOL_CALLS_ALL !== '1';
 
         if (useCodeAct) {
-          log(`Phase 2 CodeAct primary: ${agent}/${missionId}/${pipelineStage}`);
+          log(
+            `Phase 2 CodeAct primary: ${agent}/${missionId}/${pipelineStage}`,
+          );
           const llmAdapter: LLMClient = {
             async complete({ messages }) {
               const portkeyCfg = {
@@ -1868,9 +1980,11 @@ async function runAsyncAgent(req: AsyncAgentRequest): Promise<void> {
         // `protocol` (Phase 2 Track A) tells the Worker which protocol path
         // produced this row so agent_runs.protocol matches reality.
         metadata: {
-          protocol: req.protocol === 'codeact' && process.env.FORCE_TOOL_CALLS_ALL !== '1'
-            ? 'codeact'
-            : 'tool_calls',
+          protocol:
+            req.protocol === 'codeact' &&
+            process.env.FORCE_TOOL_CALLS_ALL !== '1'
+              ? 'codeact'
+              : 'tool_calls',
           tokensIn: result.tokensIn,
           tokensOut: result.tokensOut,
           toolCallCount: result.toolCallCount,
@@ -2259,11 +2373,12 @@ const server = createServer(async (req, res) => {
       log(`Received /api/agent/run-async request`);
 
       // Auth: Cloudflare tunnel validates CF Access headers (strips them before
-      // forwarding to origin). Hub-api validates the shared AGENT_RESULTS_SECRET
-      // as a bearer token for defense-in-depth.
-      if (AGENT_RESULTS_SECRET) {
+      // forwarding to origin). Hub-api validates a service bearer token for
+      // defense-in-depth, accepting the per-consumer token and the legacy
+      // shared secret simultaneously during the migration.
+      {
         const auth = req.headers['authorization'];
-        if (!auth || auth !== `Bearer ${AGENT_RESULTS_SECRET}`) {
+        if (!isAuthorizedInbound(auth)) {
           log('Agent async auth rejected: invalid bearer token');
           jsonResponse(res, 403, { error: 'Invalid authorization' });
           return;
@@ -2531,9 +2646,9 @@ const server = createServer(async (req, res) => {
   // removed first.
   if (url.pathname === '/api/worktree/create' && method === 'POST') {
     try {
-      if (AGENT_RESULTS_SECRET) {
+      {
         const auth = req.headers['authorization'];
-        if (!auth || auth !== `Bearer ${AGENT_RESULTS_SECRET}`) {
+        if (!isAuthorizedInbound(auth)) {
           log('Worktree create auth rejected: invalid bearer token');
           jsonResponse(res, 403, { error: 'Invalid authorization' });
           return;
@@ -2996,9 +3111,9 @@ const server = createServer(async (req, res) => {
 
   // POST /api/vault/promote — quarantine or confirm a note for vault promotion
   if (url.pathname === '/api/vault/promote' && method === 'POST') {
-    if (AGENT_RESULTS_SECRET) {
+    {
       const auth = req.headers['authorization'];
-      if (!auth || auth !== `Bearer ${AGENT_RESULTS_SECRET}`) {
+      if (!isAuthorizedInbound(auth)) {
         jsonResponse(res, 403, { error: 'Invalid authorization' });
         return;
       }
@@ -3131,9 +3246,9 @@ const server = createServer(async (req, res) => {
 
   // GET /api/vault/quarantine — list quarantined notes
   if (url.pathname === '/api/vault/quarantine' && method === 'GET') {
-    if (AGENT_RESULTS_SECRET) {
+    {
       const auth = req.headers['authorization'];
-      if (!auth || auth !== `Bearer ${AGENT_RESULTS_SECRET}`) {
+      if (!isAuthorizedInbound(auth)) {
         jsonResponse(res, 403, { error: 'Invalid authorization' });
         return;
       }
@@ -3158,9 +3273,9 @@ const server = createServer(async (req, res) => {
 
   // DELETE /api/vault/quarantine — reject a quarantined note
   if (url.pathname === '/api/vault/quarantine' && method === 'DELETE') {
-    if (AGENT_RESULTS_SECRET) {
+    {
       const auth = req.headers['authorization'];
-      if (!auth || auth !== `Bearer ${AGENT_RESULTS_SECRET}`) {
+      if (!isAuthorizedInbound(auth)) {
         jsonResponse(res, 403, { error: 'Invalid authorization' });
         return;
       }
